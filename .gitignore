@@ -1,0 +1,15 @@
+stock_run_88/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+node_modules/
+frontend/dist/
+*.db
+data/*.db*
+data/stock_run.db.*
+logs/*
+reports/*
+agent_memory/
+data/minute/
+.env
