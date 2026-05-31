@@ -122,9 +122,23 @@ sudo systemctl reload nginx
 
 ## 后续发版
 
+当前仓库可用 `.github/workflows/deploy.yml` 自动部署：GitHub Actions 会 checkout 源码，通过 SSH/SCP 上传到服务器 `/tmp/stock_run_88_release`，再同步到 `/opt/stock_run_88`，保留服务器上的 `.env`、`.venv`、`data/`、`logs/`、`reports/`、`agent_memory/`。
+
+在 GitHub 仓库 `Settings -> Secrets and variables -> Actions` 配置：
+
+```text
+SERVER_HOST=服务器公网 IP
+SERVER_USER=ubuntu
+SERVER_SSH_KEY=用于登录服务器的私钥内容
+SERVER_PORT=22
+```
+
+之后推送到 `main` 会自动部署。也可以在 GitHub Actions 页面手动运行 `Deploy` workflow。
+
+服务器侧实际执行逻辑：
+
 ```bash
 cd /opt/stock_run_88
-git pull --ff-only
 . .venv/bin/activate
 pip install -r requirements.txt
 cd frontend
@@ -133,8 +147,6 @@ npm run build
 cd ..
 sudo systemctl restart stock-run-api
 ```
-
-如果要做“本地 push 后服务器自动部署”，推荐用 GitHub Actions SSH 到服务器执行上述发版命令。服务器需先能用 SSH key 登录。
 
 ## 数据备份
 
