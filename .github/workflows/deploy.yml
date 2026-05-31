@@ -37,10 +37,10 @@ jobs:
             rsync -a --delete /tmp/stock_run_88_release/ /opt/stock_run_88/ \
               --exclude .env \
               --exclude .venv \
-              --exclude data \
-              --exclude logs \
-              --exclude reports \
-              --exclude agent_memory \
+              --exclude /data \
+              --exclude /logs \
+              --exclude /reports \
+              --exclude /agent_memory \
               --exclude frontend/node_modules \
               --exclude frontend/dist
             cd /opt/stock_run_88
