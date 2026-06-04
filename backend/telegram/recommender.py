@@ -44,6 +44,7 @@ from backend.telegram.memory import (
     update_memories_from_text,
     upsert_memory_item,
 )
+from backend.telegram.memory_distiller import maybe_schedule_memory_distillation
 from backend.policy.reader import extract_policy_signals
 from backend.telegram.knowledge import (
     best_public_agent_context,
@@ -417,7 +418,7 @@ def _identity_reply(chat_id: str, user_id: str = "", thread_id: str = "default")
     memory = read_telegram_memory()
     profile_key = _context_key(chat_id or "local", user_id)
     profile = get_profile(profile_key)
-    scoped_memory = build_memory_prompt(chat_id or "local", user_id, thread_id, "你是谁", 4, 4)
+    scoped_memory = build_memory_prompt(chat_id or "local", user_id, thread_id, "你是谁", None, 4)
     memory_line = (scoped_memory.get("prompt") or "").splitlines()[:2]
     return "\n".join([
         "我是这个项目里的 Telegram 股票推荐助手。",
@@ -771,7 +772,7 @@ def _run_rule_recommendation(
     started = time.perf_counter()
     if progress_callback:
         progress_callback({"type": "rule_start", "query": query, "mode": reason})
-    memory_context = build_memory_prompt(chat_id or "local", user_id, thread_id, query, 8, 6)
+    memory_context = build_memory_prompt(chat_id or "local", user_id, thread_id, query, None, 6)
     profile = get_profile(_context_key(chat_id or "local", user_id))
     reply = format_recommendation(
         query,
@@ -871,7 +872,7 @@ def _run_recommend_loop(
     llm = _build_recommend_llm()
     profile_key = _context_key(chat_id or "local", user_id)
     profile = apply_inferred_preferences(profile_key, user_input, username)
-    memory_context = build_memory_prompt(chat_id or "local", user_id, thread_id, user_input, 12, 8)
+    memory_context = build_memory_prompt(chat_id or "local", user_id, thread_id, user_input, None, 8)
     result = ReActLoop(
         llm,
         RECOMMEND_TOOLS,
@@ -1071,6 +1072,7 @@ def handle_text_message(
         intent=intent,
         metadata={"reply_to": message_id, "username": username or ""},
     )
+    maybe_schedule_memory_distillation(chat_id or "local", user_id or "", thread_id, chat_type)
     return reply
 
 

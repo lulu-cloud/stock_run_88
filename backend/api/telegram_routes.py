@@ -32,6 +32,7 @@ from backend.telegram.evaluation import (
     update_recommend_outcomes,
 )
 from backend.telegram.memory import delete_memory_item, list_memory_items, record_message, update_memories_from_text
+from backend.telegram.memory_distiller import distill_now, get_distill_state, maybe_schedule_memory_distillation
 from backend.db.repository import get_conn
 
 router = APIRouter(prefix="/api/telegram", tags=["telegram"])
@@ -240,6 +241,7 @@ async def telegram_recommend(req: ChatTestRequest):
             intent="recommend",
             metadata={"reply_to": message_id, "eval_id": result.get("eval_id")},
         )
+    maybe_schedule_memory_distillation(req.chat_id, req.user_id, req.thread_id, req.chat_type)
     return result
 
 
@@ -257,6 +259,28 @@ async def telegram_memory(
 @router.delete("/memory/{memory_id}")
 async def telegram_memory_delete(memory_id: int):
     return {"ok": delete_memory_item(memory_id)}
+
+
+@router.get("/memory/distill/status")
+async def telegram_memory_distill_status(
+    chat_id: str = Query("local"),
+    user_id: str = Query(""),
+    thread_id: str = Query("default"),
+):
+    return get_distill_state(chat_id, user_id, thread_id)
+
+
+@router.post("/memory/distill/run")
+async def telegram_memory_distill_run(
+    chat_id: str = Query("local"),
+    user_id: str = Query(""),
+    thread_id: str = Query("default"),
+    chat_type: str = Query(""),
+    async_run: bool = Query(True),
+):
+    if async_run:
+        return maybe_schedule_memory_distillation(chat_id, user_id, thread_id, chat_type)
+    return distill_now(chat_id, user_id, thread_id, chat_type)
 
 
 @router.get("/recommend/trace/{recommendation_id}")

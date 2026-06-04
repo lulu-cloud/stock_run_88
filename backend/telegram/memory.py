@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any
 
@@ -12,6 +13,12 @@ from backend.telegram.stock_analysis import extract_stock_mentions, lookup_stock
 
 DEFAULT_THREAD_ID = "default"
 MEMORY_LIMIT = 80
+SHORT_TERM_MIN_TURNS = 5
+SHORT_TERM_MAX_TURNS = 8
+SHORT_TERM_DEFAULT_TURNS = max(
+    SHORT_TERM_MIN_TURNS,
+    min(int(os.environ.get("TELEGRAM_SHORT_TERM_TURNS", "6") or 6), SHORT_TERM_MAX_TURNS),
+)
 
 
 def normalize_thread_id(thread_id: str | int | None) -> str:
@@ -109,6 +116,12 @@ def get_recent_context(chat_id: str, thread_id: str | int | None = DEFAULT_THREA
     ).fetchall()
     conn.close()
     return [_row_to_dict(r) for r in reversed(rows)]
+
+
+def short_term_message_limit(turns: int | None = None) -> int:
+    safe_turns = SHORT_TERM_DEFAULT_TURNS if turns is None else int(turns or SHORT_TERM_DEFAULT_TURNS)
+    safe_turns = max(SHORT_TERM_MIN_TURNS, min(safe_turns, SHORT_TERM_MAX_TURNS))
+    return safe_turns * 2
 
 
 def _scope_filters(user_id: str, chat_id: str, thread_id: str | int | None) -> list[tuple[str, str]]:
@@ -294,11 +307,11 @@ def build_memory_prompt(
     user_id: str = "",
     thread_id: str | int | None = DEFAULT_THREAD_ID,
     query: str = "",
-    recent_limit: int = 12,
+    recent_limit: int | None = None,
     memory_limit: int = 8,
 ) -> dict:
     """Build context payload for the recommender prompt."""
-    recent = get_recent_context(chat_id or "local", thread_id, recent_limit)
+    recent = get_recent_context(chat_id or "local", thread_id, recent_limit or short_term_message_limit())
     memories = search_memories(user_id, chat_id or "local", thread_id, query, memory_limit)
     lines: list[str] = []
     if memories:
