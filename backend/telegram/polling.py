@@ -116,14 +116,26 @@ def _handle_update(update: dict):
     message = update.get("message") or {}
     text = message.get("text")
     chat = message.get("chat") or {}
+    from_user = message.get("from") or {}
     chat_id = str(chat.get("id") or "")
-    username = chat.get("username") or chat.get("first_name") or ""
+    user_id = str(from_user.get("id") or "")
+    username = from_user.get("username") or from_user.get("first_name") or chat.get("username") or chat.get("first_name") or ""
+    thread_id = str(message.get("message_thread_id") or "default")
+    chat_type = str(chat.get("type") or "")
     if not text or not chat_id:
         return
     progress = _TelegramProgress(chat_id)
     try:
         progress.start()
-        response = handle_text_message(text, chat_id, username, progress_callback=progress.on_event)
+        response = handle_text_message(
+            text,
+            chat_id,
+            username,
+            progress_callback=progress.on_event,
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_type=chat_type,
+        )
         progress.finish()
         result = send_html_message(chat_id, response)
         if not result.get("ok"):

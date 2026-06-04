@@ -31,6 +31,7 @@ from backend.telegram.evaluation import (
     refresh_eval_feedback,
     update_recommend_outcomes,
 )
+from backend.telegram.memory import delete_memory_item, list_memory_items, record_message, update_memories_from_text
 from backend.db.repository import get_conn
 
 router = APIRouter(prefix="/api/telegram", tags=["telegram"])
@@ -46,6 +47,9 @@ class ChatTestRequest(BaseModel):
     text: str
     chat_id: str = "local"
     username: str = ""
+    user_id: str = ""
+    thread_id: str = "default"
+    chat_type: str = ""
 
 
 class ProfileUpdateRequest(BaseModel):
@@ -174,7 +178,16 @@ async def telegram_polling_stop():
 @router.post("/chat/test")
 async def telegram_chat_test(req: ChatTestRequest):
     """本地测试 Telegram 文本解析，不需要真实 Telegram 消息。"""
-    return {"reply": handle_text_message(req.text, req.chat_id, req.username)}
+    return {
+        "reply": handle_text_message(
+            req.text,
+            req.chat_id,
+            req.username,
+            user_id=req.user_id,
+            thread_id=req.thread_id,
+            chat_type=req.chat_type,
+        )
+    }
 
 
 @router.get("/agent-performance/{agent_id}")
@@ -189,7 +202,61 @@ async def telegram_simulation_performance(sim_id: int):
 
 @router.post("/recommend")
 async def telegram_recommend(req: ChatTestRequest):
-    return run_recommend_react_agent(req.text, req.chat_id, req.username)
+    message_id = record_message(
+        req.chat_id,
+        user_id=req.user_id,
+        thread_id=req.thread_id,
+        chat_type=req.chat_type,
+        role="user",
+        content=req.text,
+        intent="recommend",
+        metadata={"username": req.username},
+    )
+    update_memories_from_text(
+        req.chat_id,
+        user_id=req.user_id,
+        thread_id=req.thread_id,
+        chat_type=req.chat_type,
+        text=req.text,
+        source_message_id=message_id,
+        intent="recommend",
+    )
+    result = run_recommend_react_agent(
+        req.text,
+        req.chat_id,
+        req.username,
+        user_id=req.user_id,
+        thread_id=req.thread_id,
+        chat_type=req.chat_type,
+    )
+    if result.get("message"):
+        record_message(
+            req.chat_id,
+            user_id=req.user_id,
+            thread_id=req.thread_id,
+            chat_type=req.chat_type,
+            role="assistant",
+            content=result.get("message") or "",
+            intent="recommend",
+            metadata={"reply_to": message_id, "eval_id": result.get("eval_id")},
+        )
+    return result
+
+
+@router.get("/memory")
+async def telegram_memory(
+    chat_id: str = Query("local"),
+    user_id: str = Query(""),
+    thread_id: str = Query("default"),
+    scope: str = Query(""),
+    limit: int = Query(80),
+):
+    return {"items": list_memory_items(chat_id, user_id, thread_id, scope, limit)}
+
+
+@router.delete("/memory/{memory_id}")
+async def telegram_memory_delete(memory_id: int):
+    return {"ok": delete_memory_item(memory_id)}
 
 
 @router.get("/recommend/trace/{recommendation_id}")

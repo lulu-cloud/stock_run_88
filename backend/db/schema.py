@@ -587,6 +587,44 @@ CREATE TABLE IF NOT EXISTS telegram_watchlist (
     created_at      TEXT DEFAULT (datetime('now')),
     UNIQUE(chat_id, ts_code)
 );
+
+CREATE TABLE IF NOT EXISTS telegram_conversation_message (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform        TEXT DEFAULT 'telegram',
+    chat_id         TEXT NOT NULL,
+    user_id         TEXT,
+    thread_id       TEXT DEFAULT 'default',
+    chat_type       TEXT,
+    role            TEXT NOT NULL CHECK(role IN ('user', 'assistant', 'tool', 'system')),
+    content         TEXT NOT NULL,
+    intent          TEXT,
+    metadata_json   TEXT DEFAULT '{}',
+    created_at      TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS telegram_memory_item (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope           TEXT NOT NULL CHECK(scope IN ('user', 'chat', 'thread', 'global')),
+    scope_id        TEXT NOT NULL,
+    memory_type     TEXT DEFAULT 'fact',
+    content         TEXT NOT NULL,
+    keywords        TEXT DEFAULT '',
+    importance      REAL DEFAULT 0.5,
+    last_used_at    TEXT,
+    source_message_id INTEGER REFERENCES telegram_conversation_message(id),
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now')),
+    UNIQUE(scope, scope_id, memory_type, content)
+);
+
+CREATE INDEX IF NOT EXISTS idx_telegram_msg_chat_thread
+    ON telegram_conversation_message(chat_id, thread_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_telegram_msg_user
+    ON telegram_conversation_message(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_telegram_memory_scope
+    ON telegram_memory_item(scope, scope_id, importance, updated_at);
+CREATE INDEX IF NOT EXISTS idx_telegram_memory_type
+    ON telegram_memory_item(memory_type, updated_at);
 """
 
 

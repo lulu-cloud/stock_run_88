@@ -98,6 +98,18 @@ def record_stock_interest(
     )
     conn.commit()
     conn.close()
+    try:
+        from backend.telegram.memory import upsert_memory_item
+
+        upsert_memory_item(
+            "chat",
+            chat_id or "local",
+            "stock_interest",
+            f"{code} {name}: Telegram 用户关注/提及，意图={intent}，板块={sector or '未知'}，上下文={_safe_context(context)}",
+            0.72,
+        )
+    except Exception:
+        pass
     return {"ok": True, "ts_code": code, "stock_name": name, "report_path": path}
 
 
