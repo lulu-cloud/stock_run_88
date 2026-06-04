@@ -239,6 +239,76 @@ def upsert_memory_item(
     return {"ok": True, "id": int(row["id"] if row else cur.lastrowid or 0)}
 
 
+def get_session_summary(
+    chat_id: str = "local",
+    user_id: str = "",
+    thread_id: str | int | None = DEFAULT_THREAD_ID,
+) -> dict:
+    """Return the medium-term summary for the current user/chat/thread session."""
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            """SELECT * FROM telegram_session_summary
+               WHERE chat_id=? AND user_id=? AND thread_id=?""",
+            (chat_id or "local", str(user_id or ""), normalize_thread_id(thread_id)),
+        ).fetchone()
+    except Exception:
+        row = None
+    conn.close()
+    if not row:
+        return {}
+    data = _row_to_dict(row)
+    try:
+        data["facts"] = json.loads(data.get("facts_json") or "{}")
+    except Exception:
+        data["facts"] = {}
+    return data
+
+
+def upsert_session_summary(
+    chat_id: str,
+    user_id: str = "",
+    thread_id: str | int | None = DEFAULT_THREAD_ID,
+    chat_type: str = "",
+    summary: str = "",
+    facts: dict | None = None,
+    last_message_id: int = 0,
+) -> dict:
+    """Persist medium-term session state for the current conversation scope."""
+    text = re.sub(r"\s+", " ", summary or "").strip()
+    if not text:
+        return {"ok": False, "error": "empty summary"}
+    conn = get_conn()
+    cur = conn.execute(
+        """INSERT INTO telegram_session_summary
+           (chat_id, user_id, thread_id, chat_type, summary, facts_json, last_message_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(chat_id, user_id, thread_id) DO UPDATE SET
+             chat_type=excluded.chat_type,
+             summary=excluded.summary,
+             facts_json=excluded.facts_json,
+             last_message_id=max(telegram_session_summary.last_message_id, excluded.last_message_id),
+             updated_at=datetime('now')""",
+        (
+            chat_id or "local",
+            str(user_id or ""),
+            normalize_thread_id(thread_id),
+            chat_type or "",
+            text[:1600],
+            json.dumps(facts or {}, ensure_ascii=False, default=str),
+            int(last_message_id or 0),
+        ),
+    )
+    conn.commit()
+    row = conn.execute(
+        """SELECT * FROM telegram_session_summary
+           WHERE chat_id=? AND user_id=? AND thread_id=?""",
+        (chat_id or "local", str(user_id or ""), normalize_thread_id(thread_id)),
+    ).fetchone()
+    conn.close()
+    return {"ok": True, "id": int(row["id"] if row else cur.lastrowid or 0)}
+
+
 def extract_memory_candidates(text: str, role: str = "user", intent: str = "") -> list[dict]:
     """Heuristic memory extraction. Conservative by design to avoid noisy memories."""
     if role != "user":
@@ -311,19 +381,36 @@ def build_memory_prompt(
     memory_limit: int = 8,
 ) -> dict:
     """Build context payload for the recommender prompt."""
-    recent = get_recent_context(chat_id or "local", thread_id, recent_limit or short_term_message_limit())
+    effective_recent_limit = recent_limit or short_term_message_limit()
+    recent = get_recent_context(chat_id or "local", thread_id, effective_recent_limit)
+    session_summary = get_session_summary(chat_id or "local", user_id, thread_id)
     memories = search_memories(user_id, chat_id or "local", thread_id, query, memory_limit)
     lines: list[str] = []
+    if session_summary.get("summary"):
+        lines.append("中期 session 摘要:")
+        lines.append(f"- {session_summary.get('summary')}")
     if memories:
-        lines.append("相关长期记忆:")
+        lines.append("长期画像/记忆:")
         for item in memories:
             lines.append(f"- [{item.get('scope')}/{item.get('memory_type')}] {item.get('content')}")
     if recent:
-        lines.append("最近对话:")
-        for msg in recent[-recent_limit:]:
+        lines.append(f"短期最近对话（最近约 {effective_recent_limit // 2} 轮）:")
+        for msg in recent[-effective_recent_limit:]:
             content = re.sub(r"\s+", " ", msg.get("content") or "").strip()[:220]
             lines.append(f"- {msg.get('role')}: {content}")
-    return {"prompt": "\n".join(lines), "memories": memories, "recent_messages": recent}
+    return {
+        "prompt": "\n".join(lines),
+        "session_summary": session_summary,
+        "long_term_memories": memories,
+        "memories": memories,
+        "short_term_messages": recent,
+        "recent_messages": recent,
+        "layers": {
+            "short_term": recent,
+            "medium_term": session_summary,
+            "long_term": memories,
+        },
+    }
 
 
 def list_memory_items(
@@ -402,9 +489,14 @@ def format_memory_overview(
     limit: int = 20,
 ) -> str:
     items = list_memory_items(chat_id, user_id, thread_id, "", limit)
-    if not items:
+    session_summary = get_session_summary(chat_id, user_id, thread_id)
+    if not items and not session_summary:
         return "当前还没有沉淀长期记忆。你可以说“记住我偏好短线右侧交易”。"
-    lines = ["当前可用记忆:"]
+    lines = ["当前记忆:"]
+    if session_summary.get("summary"):
+        lines.append(f"- [session/summary] {session_summary['summary'][:220]}")
+    if items:
+        lines.append("长期记忆:")
     for item in items[:limit]:
         lines.append(
             f"- #{item['id']} [{item['scope']}/{item['memory_type']}] "

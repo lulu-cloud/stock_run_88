@@ -31,7 +31,13 @@ from backend.telegram.evaluation import (
     refresh_eval_feedback,
     update_recommend_outcomes,
 )
-from backend.telegram.memory import delete_memory_item, list_memory_items, record_message, update_memories_from_text
+from backend.telegram.memory import (
+    delete_memory_item,
+    get_session_summary,
+    list_memory_items,
+    record_message,
+    update_memories_from_text,
+)
 from backend.telegram.memory_distiller import distill_now, get_distill_state, maybe_schedule_memory_distillation
 from backend.db.repository import get_conn
 
@@ -259,6 +265,15 @@ async def telegram_memory(
 @router.delete("/memory/{memory_id}")
 async def telegram_memory_delete(memory_id: int):
     return {"ok": delete_memory_item(memory_id)}
+
+
+@router.get("/memory/session")
+async def telegram_memory_session(
+    chat_id: str = Query("local"),
+    user_id: str = Query(""),
+    thread_id: str = Query("default"),
+):
+    return get_session_summary(chat_id, user_id, thread_id)
 
 
 @router.get("/memory/distill/status")

@@ -20,6 +20,7 @@ from backend.telegram.memory import (
     short_term_message_limit,
     thread_scope_id,
     upsert_memory_item,
+    upsert_session_summary,
 )
 
 
@@ -38,6 +39,7 @@ SYSTEM_PROMPT = """你是 Telegram 股票推荐助手的长期记忆提炼器。
 
 输出必须是 JSON，不要 Markdown 代码块，结构如下：
 {
+  "session_summary":{"content":"当前会话正在围绕多头均线回踩策略筛选A股，用户希望答案直接、给出理由和风险","current_task":"多头均线回踩选股","open_questions":["是否偏好主板"],"confidence":0.82},
   "user_preferences":[{"content":"用户偏好短线右侧交易","confidence":0.82,"importance":0.75}],
   "risk_profile":[{"content":"用户风险偏好偏高，但不喜欢无理由追高","confidence":0.78,"importance":0.75}],
   "stock_interests":[{"ts_code":"000725.SZ","name":"京东方A","content":"用户多次询问京东方A走势","confidence":0.8,"importance":0.8}],
@@ -51,6 +53,7 @@ SYSTEM_PROMPT = """你是 Telegram 股票推荐助手的长期记忆提炼器。
 - user_preferences/risk_profile/stock_interests 只写当前用户的稳定偏好或关注标的。
 - chat_norms 只写当前群聊的群规则、共同偏好或长期背景。
 - thread_summary 只写当前 topic/话题的稳定上下文。
+- session_summary 是中期会话状态，记录当前任务、正在讨论的主题、尚未解决的问题；它可以比长期记忆更具体，但不要写无关闲聊。
 - content 必须短、具体、可复用。
 """
 
@@ -241,12 +244,40 @@ def _memory_items(payload: dict, chat_id: str, user_id: str, thread_id: str) -> 
     return items
 
 
-def persist_distilled_memory(payload: dict, chat_id: str, user_id: str = "", thread_id: str = DEFAULT_THREAD_ID) -> list[dict]:
-    """Persist high-confidence distilled memory items."""
+def persist_distilled_memory(
+    payload: dict,
+    chat_id: str,
+    user_id: str = "",
+    thread_id: str = DEFAULT_THREAD_ID,
+    chat_type: str = "",
+    last_message_id: int = 0,
+) -> dict:
+    """Persist medium-term summary and high-confidence long-term memory items."""
+    session_result = {}
+    session_payload = payload.get("session_summary") or {}
+    if isinstance(session_payload, str):
+        session_payload = {"content": session_payload, "confidence": 1.0}
+    if isinstance(session_payload, dict):
+        session_confidence = float(session_payload.get("confidence") or 0)
+        session_content = str(session_payload.get("content") or "").strip()
+        if session_content and session_confidence >= 0.6:
+            session_result = upsert_session_summary(
+                chat_id or "local",
+                user_id or "",
+                thread_id or DEFAULT_THREAD_ID,
+                chat_type or "",
+                session_content,
+                {
+                    "current_task": session_payload.get("current_task") or "",
+                    "open_questions": session_payload.get("open_questions") or [],
+                    "confidence": session_confidence,
+                },
+                last_message_id,
+            )
     results: list[dict] = []
     for scope, scope_id, memory_type, content, importance in _memory_items(payload, chat_id, user_id, thread_id):
         results.append(upsert_memory_item(scope, scope_id, memory_type, content, importance))
-    return results
+    return {"session_summary": session_result, "long_term_memories": results}
 
 
 def distill_now(chat_id: str, user_id: str = "", thread_id: str = DEFAULT_THREAD_ID, chat_type: str = "") -> dict:
@@ -280,7 +311,7 @@ def distill_now(chat_id: str, user_id: str = "", thread_id: str = DEFAULT_THREAD
         payload = _extract_json(str(getattr(response, "content", "") or ""))
         if not payload:
             raise ValueError("memory distiller did not return valid JSON")
-        persisted = persist_distilled_memory(payload, chat_id, user_id, thread_id)
+        persisted = persist_distilled_memory(payload, chat_id, user_id, thread_id, chat_type, latest_message_id)
         result = {"persisted": persisted, "payload": payload}
         _mark_state(
             chat_id,

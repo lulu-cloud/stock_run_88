@@ -634,6 +634,20 @@ CREATE TABLE IF NOT EXISTS telegram_memory_distill_state (
     UNIQUE(chat_id, user_id, thread_id)
 );
 
+CREATE TABLE IF NOT EXISTS telegram_session_summary (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id         TEXT NOT NULL,
+    user_id         TEXT DEFAULT '',
+    thread_id       TEXT DEFAULT 'default',
+    chat_type       TEXT DEFAULT '',
+    summary         TEXT NOT NULL,
+    facts_json      TEXT DEFAULT '{}',
+    last_message_id INTEGER DEFAULT 0,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now')),
+    UNIQUE(chat_id, user_id, thread_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_telegram_msg_chat_thread
     ON telegram_conversation_message(chat_id, thread_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_telegram_msg_user
@@ -644,6 +658,8 @@ CREATE INDEX IF NOT EXISTS idx_telegram_memory_type
     ON telegram_memory_item(memory_type, updated_at);
 CREATE INDEX IF NOT EXISTS idx_telegram_memory_distill_state
     ON telegram_memory_distill_state(chat_id, user_id, thread_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_telegram_session_summary_scope
+    ON telegram_session_summary(chat_id, user_id, thread_id, updated_at);
 """
 
 
