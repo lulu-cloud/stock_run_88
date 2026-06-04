@@ -13,6 +13,7 @@ from backend.telegram.stock_analysis import extract_stock_mentions, lookup_stock
 
 DEFAULT_THREAD_ID = "default"
 MEMORY_LIMIT = 80
+LONG_TERM_MAX_PER_SCOPE = max(10, int(os.environ.get("TELEGRAM_LONG_TERM_MEMORY_MAX_PER_SCOPE", "80") or 80))
 SHORT_TERM_MIN_TURNS = 5
 SHORT_TERM_MAX_TURNS = 8
 SHORT_TERM_DEFAULT_TURNS = max(
@@ -161,7 +162,7 @@ def search_memories(
             params.append(limit)
             rows = conn.execute(
                 f"""SELECT * FROM telegram_memory_item
-                    WHERE scope=? AND scope_id=? AND ({clauses})
+                    WHERE scope=? AND scope_id=? AND status='active' AND ({clauses})
                     ORDER BY importance DESC, updated_at DESC, id DESC
                     LIMIT ?""",
                 tuple(params),
@@ -169,7 +170,7 @@ def search_memories(
         else:
             rows = conn.execute(
                 """SELECT * FROM telegram_memory_item
-                   WHERE scope=? AND scope_id=?
+                   WHERE scope=? AND scope_id=? AND status='active'
                    ORDER BY importance DESC, updated_at DESC, id DESC
                    LIMIT ?""",
                 (scope, scope_id, limit),
@@ -212,12 +213,16 @@ def upsert_memory_item(
     conn = get_conn()
     cur = conn.execute(
         """INSERT INTO telegram_memory_item
-           (scope, scope_id, memory_type, content, keywords, importance, source_message_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
+           (scope, scope_id, memory_type, content, keywords, importance, status, source_message_id)
+           VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
            ON CONFLICT(scope, scope_id, memory_type, content) DO UPDATE SET
              keywords=excluded.keywords,
              importance=max(telegram_memory_item.importance, excluded.importance),
+             status='active',
+             archived_at=NULL,
+             superseded_by_id=NULL,
              source_message_id=COALESCE(excluded.source_message_id, telegram_memory_item.source_message_id),
+             last_reason='reinforced',
              updated_at=datetime('now')""",
         (
             scope,
@@ -236,7 +241,92 @@ def upsert_memory_item(
         (scope, scope_id, memory_type or "fact", text[:1000]),
     ).fetchone()
     conn.close()
-    return {"ok": True, "id": int(row["id"] if row else cur.lastrowid or 0)}
+    memory_id = int(row["id"] if row else cur.lastrowid or 0)
+    pruned = prune_memory_scope(scope, scope_id)
+    return {"ok": True, "id": memory_id, "pruned": pruned}
+
+
+def archive_memory_item(
+    memory_id: int,
+    reason: str = "archived",
+    superseded_by_id: int | None = None,
+) -> bool:
+    """Mark a long-term memory inactive without deleting history."""
+    conn = get_conn()
+    cur = conn.execute(
+        """UPDATE telegram_memory_item
+           SET status='archived',
+               archived_at=datetime('now'),
+               superseded_by_id=?,
+               last_reason=?,
+               updated_at=datetime('now')
+           WHERE id=?""",
+        (superseded_by_id, reason or "archived", int(memory_id)),
+    )
+    conn.commit()
+    ok = cur.rowcount > 0
+    conn.close()
+    return ok
+
+
+def adjust_memory_importance(memory_id: int, delta: float, reason: str = "") -> bool:
+    """Lower or raise a memory's importance while preserving it."""
+    conn = get_conn()
+    cur = conn.execute(
+        """UPDATE telegram_memory_item
+           SET importance=max(0.0, min(1.0, importance + ?)),
+               last_reason=?,
+               updated_at=datetime('now')
+           WHERE id=? AND status='active'""",
+        (float(delta or 0), reason or "importance_adjusted", int(memory_id)),
+    )
+    conn.commit()
+    ok = cur.rowcount > 0
+    conn.close()
+    return ok
+
+
+def list_scope_memories(scope: str, scope_id: str, limit: int = 60, active_only: bool = True) -> list[dict]:
+    safe_limit = max(1, min(int(limit or 60), 200))
+    status_clause = "AND status='active'" if active_only else ""
+    conn = get_conn()
+    rows = conn.execute(
+        f"""SELECT * FROM telegram_memory_item
+            WHERE scope=? AND scope_id=? {status_clause}
+            ORDER BY importance DESC, updated_at DESC, id DESC
+            LIMIT ?""",
+        (scope, scope_id, safe_limit),
+    ).fetchall()
+    conn.close()
+    return [_row_to_dict(r) for r in rows]
+
+
+def prune_memory_scope(scope: str, scope_id: str, max_items: int | None = None) -> int:
+    """Archive low-value active memories beyond the configured scope cap."""
+    cap = int(max_items or LONG_TERM_MAX_PER_SCOPE)
+    if cap <= 0:
+        return 0
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT id FROM telegram_memory_item
+           WHERE scope=? AND scope_id=? AND status='active'
+           ORDER BY importance DESC, updated_at DESC, id DESC""",
+        (scope, scope_id),
+    ).fetchall()
+    overflow = [int(r["id"]) for r in rows[cap:]]
+    if overflow:
+        conn.execute(
+            f"""UPDATE telegram_memory_item
+                SET status='archived',
+                    archived_at=datetime('now'),
+                    last_reason='scope_cap_pruned',
+                    updated_at=datetime('now')
+                WHERE id IN ({','.join('?' for _ in overflow)})""",
+            tuple(overflow),
+        )
+    conn.commit()
+    conn.close()
+    return len(overflow)
 
 
 def get_session_summary(
@@ -429,7 +519,7 @@ def list_memory_items(
         if scope:
             rows = conn.execute(
                 """SELECT * FROM telegram_memory_item
-                   WHERE scope=?
+                   WHERE scope=? AND status='active'
                    ORDER BY importance DESC, updated_at DESC, id DESC
                    LIMIT ?""",
                 (sc, safe_limit),
@@ -437,7 +527,7 @@ def list_memory_items(
         else:
             rows = conn.execute(
                 """SELECT * FROM telegram_memory_item
-                   WHERE scope=? AND scope_id=?
+                   WHERE scope=? AND scope_id=? AND status='active'
                    ORDER BY importance DESC, updated_at DESC, id DESC
                    LIMIT ?""",
                 (sc, sid, safe_limit),
@@ -450,12 +540,7 @@ def list_memory_items(
 
 
 def delete_memory_item(memory_id: int) -> bool:
-    conn = get_conn()
-    cur = conn.execute("DELETE FROM telegram_memory_item WHERE id=?", (int(memory_id),))
-    conn.commit()
-    ok = cur.rowcount > 0
-    conn.close()
-    return ok
+    return archive_memory_item(memory_id, "user_deleted")
 
 
 def forget_memories_by_keyword(
@@ -472,8 +557,12 @@ def forget_memories_by_keyword(
     deleted = 0
     for scope, scope_id in scopes:
         cur = conn.execute(
-            """DELETE FROM telegram_memory_item
-               WHERE scope=? AND scope_id=? AND (content LIKE ? OR keywords LIKE ?)""",
+            """UPDATE telegram_memory_item
+               SET status='archived',
+                   archived_at=datetime('now'),
+                   last_reason='user_deleted_keyword',
+                   updated_at=datetime('now')
+               WHERE scope=? AND scope_id=? AND status='active' AND (content LIKE ? OR keywords LIKE ?)""",
             (scope, scope_id, f"%{key}%", f"%{key}%"),
         )
         deleted += cur.rowcount

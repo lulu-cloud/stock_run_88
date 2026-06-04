@@ -16,6 +16,9 @@ from backend.config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL
 from backend.db.repository import get_conn
 from backend.telegram.memory import (
     DEFAULT_THREAD_ID,
+    adjust_memory_importance,
+    archive_memory_item,
+    list_scope_memories,
     profile_scope_id,
     short_term_message_limit,
     thread_scope_id,
@@ -45,6 +48,7 @@ SYSTEM_PROMPT = """你是 Telegram 股票推荐助手的长期记忆提炼器。
   "stock_interests":[{"ts_code":"000725.SZ","name":"京东方A","content":"用户多次询问京东方A走势","confidence":0.8,"importance":0.8}],
   "chat_norms":[{"content":"本群默认讨论A股，回答要简洁","confidence":0.76,"importance":0.7}],
   "thread_summary":[{"content":"本话题围绕多头均线回踩策略选股","confidence":0.78,"importance":0.68}],
+  "memory_updates":[{"existing_id":12,"action":"deprioritize","reason":"用户近期多次表达更稳健，旧的激进偏好应降权"}],
   "do_not_remember":["一次性闲聊或低置信内容"]
 }
 
@@ -54,6 +58,12 @@ SYSTEM_PROMPT = """你是 Telegram 股票推荐助手的长期记忆提炼器。
 - chat_norms 只写当前群聊的群规则、共同偏好或长期背景。
 - thread_summary 只写当前 topic/话题的稳定上下文。
 - session_summary 是中期会话状态，记录当前任务、正在讨论的主题、尚未解决的问题；它可以比长期记忆更具体，但不要写无关闲聊。
+- 如果“已有长期记忆”和新对话冲突，必须在 memory_updates 给出动作：
+  - replace：旧记忆应被新记忆替代
+  - deprioritize：旧记忆仍可能有历史价值，但应降低权重
+  - expire：旧记忆已经不适用，应归档
+  - keep：旧记忆仍有效
+- memory_updates 只能引用输入里提供的 existing_id。
 - content 必须短、具体、可复用。
 """
 
@@ -145,6 +155,17 @@ def _message_counts(chat_id: str, user_id: str, thread_id: str, after_id: int = 
         "user_count": int(row["user_count"] or 0),
         "latest_message_id": int(row["latest_message_id"] or 0),
     }
+
+
+def _existing_long_term_memories(chat_id: str, user_id: str, thread_id: str) -> list[dict]:
+    user_scope = profile_scope_id(chat_id or "local", user_id or "")
+    chat_scope = chat_id or "local"
+    thread_scope = thread_scope_id(chat_id or "local", thread_id or DEFAULT_THREAD_ID)
+    items: list[dict] = []
+    for scope, scope_id in (("user", user_scope), ("chat", chat_scope), ("thread", thread_scope)):
+        for item in list_scope_memories(scope, scope_id, limit=25, active_only=True):
+            items.append(item)
+    return items[:60]
 
 
 def should_distill(chat_id: str, user_id: str, thread_id: str) -> tuple[bool, dict]:
@@ -274,10 +295,44 @@ def persist_distilled_memory(
                 },
                 last_message_id,
             )
+    update_results = apply_memory_update_actions(payload, chat_id, user_id, thread_id)
     results: list[dict] = []
     for scope, scope_id, memory_type, content, importance in _memory_items(payload, chat_id, user_id, thread_id):
         results.append(upsert_memory_item(scope, scope_id, memory_type, content, importance))
-    return {"session_summary": session_result, "long_term_memories": results}
+    return {
+        "session_summary": session_result,
+        "memory_updates": update_results,
+        "long_term_memories": results,
+    }
+
+
+def apply_memory_update_actions(payload: dict, chat_id: str, user_id: str = "", thread_id: str = DEFAULT_THREAD_ID) -> list[dict]:
+    """Apply LLM-proposed conflict updates against existing active memories."""
+    existing_ids = {
+        int(item["id"])
+        for item in _existing_long_term_memories(chat_id or "local", user_id or "", thread_id or DEFAULT_THREAD_ID)
+    }
+    results: list[dict] = []
+    for action in payload.get("memory_updates") or []:
+        if not isinstance(action, dict):
+            continue
+        memory_id = int(action.get("existing_id") or 0)
+        if memory_id not in existing_ids:
+            continue
+        op = str(action.get("action") or "").lower().strip()
+        reason = str(action.get("reason") or op or "memory_update")[:500]
+        if op in {"expire", "archive"}:
+            ok = archive_memory_item(memory_id, reason or "llm_expired")
+        elif op in {"replace", "supersede"}:
+            ok = archive_memory_item(memory_id, reason or "llm_replaced")
+        elif op in {"deprioritize", "lower", "downgrade"}:
+            ok = adjust_memory_importance(memory_id, -0.25, reason or "llm_deprioritized")
+        elif op == "keep":
+            ok = adjust_memory_importance(memory_id, 0.03, reason or "llm_kept")
+        else:
+            ok = False
+        results.append({"id": memory_id, "action": op, "ok": ok, "reason": reason})
+    return results
 
 
 def distill_now(chat_id: str, user_id: str = "", thread_id: str = DEFAULT_THREAD_ID, chat_type: str = "") -> dict:
@@ -303,6 +358,14 @@ def distill_now(chat_id: str, user_id: str = "", thread_id: str = DEFAULT_THREAD
         for msg in messages:
             content = re.sub(r"\s+", " ", msg.get("content") or "").strip()[:500]
             context_lines.append(f"- #{msg.get('id')} {msg.get('role')}({msg.get('user_id') or ''}): {content}")
+        existing_memories = _existing_long_term_memories(chat_id, user_id, thread_id)
+        if existing_memories:
+            context_lines.extend(["", "已有长期记忆（用于判断冲突，只能引用 existing_id）:"])
+            for item in existing_memories:
+                context_lines.append(
+                    f"- existing_id={item.get('id')} [{item.get('scope')}/{item.get('memory_type')}] "
+                    f"importance={float(item.get('importance') or 0):.2f} content={str(item.get('content') or '')[:360]}"
+                )
         llm = _build_llm()
         response = llm.invoke([
             SystemMessage(content=SYSTEM_PROMPT),

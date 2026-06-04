@@ -610,6 +610,10 @@ CREATE TABLE IF NOT EXISTS telegram_memory_item (
     content         TEXT NOT NULL,
     keywords        TEXT DEFAULT '',
     importance      REAL DEFAULT 0.5,
+    status          TEXT DEFAULT 'active',
+    superseded_by_id INTEGER,
+    archived_at     TEXT,
+    last_reason     TEXT DEFAULT '',
     last_used_at    TEXT,
     source_message_id INTEGER REFERENCES telegram_conversation_message(id),
     created_at      TEXT DEFAULT (datetime('now')),
@@ -653,9 +657,9 @@ CREATE INDEX IF NOT EXISTS idx_telegram_msg_chat_thread
 CREATE INDEX IF NOT EXISTS idx_telegram_msg_user
     ON telegram_conversation_message(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_telegram_memory_scope
-    ON telegram_memory_item(scope, scope_id, importance, updated_at);
+    ON telegram_memory_item(scope, scope_id, status, importance, updated_at);
 CREATE INDEX IF NOT EXISTS idx_telegram_memory_type
-    ON telegram_memory_item(memory_type, updated_at);
+    ON telegram_memory_item(memory_type, status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_telegram_memory_distill_state
     ON telegram_memory_distill_state(chat_id, user_id, thread_id, updated_at);
 CREATE INDEX IF NOT EXISTS idx_telegram_session_summary_scope
@@ -724,6 +728,10 @@ def _migrate_existing_schema(conn: sqlite3.Connection):
     _add_column_if_missing(conn, "telegram_recommend_feedback", "recommendation_json", "recommendation_json TEXT DEFAULT '{}'")
     _add_column_if_missing(conn, "shared_stock_report", "recommend_view", "recommend_view TEXT")
     _add_column_if_missing(conn, "shared_stock_report", "mention_count", "mention_count INTEGER DEFAULT 1")
+    _add_column_if_missing(conn, "telegram_memory_item", "status", "status TEXT DEFAULT 'active'")
+    _add_column_if_missing(conn, "telegram_memory_item", "superseded_by_id", "superseded_by_id INTEGER")
+    _add_column_if_missing(conn, "telegram_memory_item", "archived_at", "archived_at TEXT")
+    _add_column_if_missing(conn, "telegram_memory_item", "last_reason", "last_reason TEXT DEFAULT ''")
 
 
 def init_db(db_path: str = DATABASE_PATH) -> sqlite3.Connection:
