@@ -3,9 +3,13 @@
 from fastapi import APIRouter, Query
 
 from backend.macro.report import (
+    collect_stock_fundamental_events,
+    format_chip_distribution,
+    format_macro_topic,
     generate_macro_report,
     get_effective_macro_report_time,
     get_macro_report_row,
+    refresh_macro_intelligence,
     resolve_trade_date,
 )
 
@@ -45,6 +49,42 @@ async def generate_report(
     payload = dict(result)
     payload["report"] = _row_payload(result.get("report"))
     return payload
+
+
+@router.post("/refresh")
+async def refresh_report(
+    trade_date: str = Query(default="", description="交易日 YYYYMMDD，空为最新"),
+    refresh_policy: bool = Query(default=True, description="是否先刷新政策缓存"),
+    force: bool = Query(default=True),
+):
+    result = refresh_macro_intelligence(trade_date, refresh_policy=refresh_policy, force=force)
+    report = (result.get("report") or {}).get("report")
+    if report:
+        result["report"]["report"] = _row_payload(report)
+    return result
+
+
+@router.get("/topic")
+async def macro_topic(
+    topic: str = Query(default="report", description="report/sector/lhb/limit_up/limit_down/broken_limit/strong"),
+    trade_date: str = Query(default="", description="交易日 YYYYMMDD，空为最新"),
+):
+    return {"topic": topic, "trade_date": resolve_trade_date(trade_date), "message": format_macro_topic(topic, trade_date)}
+
+
+@router.get("/chip/{ts_code}")
+async def macro_chip(ts_code: str):
+    return {"message": format_chip_distribution(ts_code)}
+
+
+@router.get("/fundamental/{ts_code}")
+async def macro_fundamental(
+    ts_code: str,
+    trade_date: str = Query(default="", description="交易日 YYYYMMDD，空为最新"),
+    days: int = Query(default=365),
+):
+    data, status = collect_stock_fundamental_events(ts_code, trade_date, days)
+    return {"data": data, "status": status}
 
 
 @router.get("/status")

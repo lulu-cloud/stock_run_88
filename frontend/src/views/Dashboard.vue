@@ -204,7 +204,7 @@
           <span class="small-muted" v-else>{{ macroLoading ? '正在生成公共市场日报' : '暂无报告，可手动生成' }}</span>
         </div>
         <button class="btn btn-sm btn-primary" @click="generateMacroReport" :disabled="macroLoading">
-          {{ macroLoading ? '生成中...' : '重新生成' }}
+          {{ macroLoading ? '刷新中...' : '刷新宏观/政策' }}
         </button>
       </div>
       <div v-if="macroReport" class="macro-grid">
@@ -223,6 +223,7 @@
           <p>{{ macroStructured.limit_up_summary || '-' }}</p>
           <p>{{ macroStructured.lhb_summary || '-' }}</p>
           <p>{{ macroStructured.policy_signal || '-' }}</p>
+          <p>{{ macroStructured.chip_signal || '-' }}</p>
           <p class="macro-guidance">{{ macroStructured.trade_agent_guidance || '-' }}</p>
         </div>
       </div>
@@ -517,7 +518,7 @@ async function loadMacroReport() {
 async function generateMacroReport() {
   macroLoading.value = true
   try {
-    const r = await macroAPI.generate('', true)
+    const r = await macroAPI.refresh('', true, true)
     macroReport.value = r.data.report?.exists ? r.data.report : null
   } finally {
     macroLoading.value = false

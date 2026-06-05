@@ -2,7 +2,10 @@
 
 import json
 import html
+import mimetypes
+import os
 import re
+import uuid
 import urllib.parse
 import urllib.request
 
@@ -44,6 +47,81 @@ def send_html_message(chat_id: str, text: str) -> dict:
     if result.get("ok"):
         return result
     return send_message(chat_id, text)
+
+
+def _multipart_request(method: str, fields: dict, file_field: str, file_path: str) -> dict:
+    if not TELEGRAM_BOT_TOKEN:
+        return {"ok": False, "error": "TELEGRAM_BOT_TOKEN is not configured"}
+    boundary = f"----stockrun{uuid.uuid4().hex}"
+    chunks: list[bytes] = []
+    for key, value in fields.items():
+        chunks.append(f"--{boundary}\r\n".encode())
+        chunks.append(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode())
+        chunks.append(str(value).encode("utf-8"))
+        chunks.append(b"\r\n")
+    filename = os.path.basename(file_path)
+    content_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+    with open(file_path, "rb") as f:
+        file_bytes = f.read()
+    chunks.append(f"--{boundary}\r\n".encode())
+    chunks.append(
+        f'Content-Disposition: form-data; name="{file_field}"; filename="{filename}"\r\n'
+        f"Content-Type: {content_type}\r\n\r\n".encode()
+    )
+    chunks.append(file_bytes)
+    chunks.append(b"\r\n")
+    chunks.append(f"--{boundary}--\r\n".encode())
+    req = urllib.request.Request(
+        _api_url(method),
+        data=b"".join(chunks),
+        method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def send_document(chat_id: str, file_path: str, caption: str = "") -> dict:
+    fields = {"chat_id": chat_id}
+    if caption:
+        fields["caption"] = caption[:1000]
+    return _multipart_request("sendDocument", fields, "document", file_path)
+
+
+def send_photo(chat_id: str, file_path: str, caption: str = "") -> dict:
+    fields = {"chat_id": chat_id}
+    if caption:
+        fields["caption"] = caption[:1000]
+    return _multipart_request("sendPhoto", fields, "photo", file_path)
+
+
+def send_rich_message(chat_id: str, text: str, title: str = "分析报告") -> dict:
+    """Send simple replies as Telegram HTML and complex Markdown as PNG/HTML artifact."""
+    from backend.telegram.rendering import is_complex_markdown, render_markdown_png, write_html_report
+
+    if not is_complex_markdown(text):
+        return send_html_message(chat_id, text)
+    caption = f"{title}\n复杂 Markdown/表格已渲染为附件。"
+    render_mode = os.environ.get("TELEGRAM_RICH_RENDER_MODE", "photo").lower()
+    if render_mode != "document":
+        try:
+            png_path = render_markdown_png(text, title)
+            result = send_photo(chat_id, png_path, caption)
+            if result.get("ok"):
+                return result
+        except Exception:
+            pass
+    try:
+        html_path = write_html_report(text, title)
+        result = send_document(chat_id, html_path, caption)
+        if result.get("ok"):
+            return result
+    except Exception:
+        pass
+    return send_html_message(chat_id, text[:3900])
 
 
 def edit_message_text(chat_id: str, message_id: int, text: str, parse_mode: str = "") -> dict:
@@ -179,7 +257,7 @@ def push_agent_summary(agent_id: int, trade_date: str) -> dict:
             profile = get_profile(b["chat_id"])
             if profile.get("daily_push_enabled"):
                 msg = build_market_digest(b["chat_id"], agent_id, trade_date)
-        result = send_html_message(b["chat_id"], msg)
+        result = send_rich_message(b["chat_id"], msg, "每日交易摘要")
         sent.append({"chat_id": b["chat_id"], "result": result})
     return {
         "sent": sent,

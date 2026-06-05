@@ -56,6 +56,10 @@ export const macroAPI = {
   status: () => api.get('/macro/status'),
   report: (date = '') => api.get(`/macro/report?trade_date=${date}`),
   generate: (date = '', force = true) => api.post(`/macro/report/generate?trade_date=${date}&force=${force}`),
+  refresh: (date = '', refreshPolicy = true, force = true) => api.post(`/macro/refresh?trade_date=${date}&refresh_policy=${refreshPolicy}&force=${force}`),
+  topic: (topic = 'report', date = '') => api.get(`/macro/topic?topic=${encodeURIComponent(topic)}&trade_date=${date}`),
+  chip: (tsCode) => api.get(`/macro/chip/${encodeURIComponent(tsCode)}`),
+  fundamental: (tsCode, date = '', days = 365) => api.get(`/macro/fundamental/${encodeURIComponent(tsCode)}?trade_date=${date}&days=${days}`),
 }
 
 export const telegramAPI = {

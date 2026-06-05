@@ -46,6 +46,7 @@ JSON 字段：
   "institution_signal": "机构席位信号",
   "policy_signal": "政策方向",
   "fundamental_events": "业绩快报/预告事件",
+  "chip_signal": "候选强势股筹码分布摘要",
   "trade_agent_guidance": "给交易Agent的仓位和选股建议",
   "risk_warnings": ["风险1", "风险2"]
 }
@@ -95,6 +96,10 @@ def _source_ok(name: str, count: int = 0) -> dict:
 def _load_akshare():
     import akshare as ak
     return ak
+
+
+def _plain_code(ts_code: str) -> str:
+    return normalize_ts_code(ts_code)[:6]
 
 
 def collect_market_snapshot(trade_date: str) -> tuple[dict, list[dict]]:
@@ -190,12 +195,99 @@ def collect_lhb_snapshot(trade_date: str) -> tuple[dict, list[dict]]:
     return result, status
 
 
+def collect_chip_distribution(ts_code: str) -> tuple[dict, list[dict]]:
+    """Collect qfq chip distribution for one stock from Eastmoney/AkShare."""
+    code = normalize_ts_code(ts_code)
+    try:
+        ak = _load_akshare()
+    except Exception as exc:
+        return {"ok": False, "ts_code": code, "error": str(exc)}, [_source_error("akshare_cyq", exc)]
+    try:
+        df = ak.stock_cyq_em(symbol=_plain_code(code), adjust="qfq")
+        if df is None or df.empty:
+            return {"ok": False, "ts_code": code, "error": "筹码分布为空"}, [_source_ok("stock_cyq_em", 0)]
+        frame = df.copy()
+        latest = frame.iloc[-1].to_dict()
+        prev = frame.iloc[-6].to_dict() if len(frame) >= 6 else frame.iloc[0].to_dict()
+        avg_cost = _safe_float(latest.get("平均成本"))
+        prev_avg_cost = _safe_float(prev.get("平均成本"))
+        profit_ratio = _safe_float(latest.get("获利比例"))
+        concentration_90 = _safe_float(latest.get("90集中度"))
+        concentration_70 = _safe_float(latest.get("70集中度"))
+        result = {
+            "ok": True,
+            "ts_code": code,
+            "source_adjust": "qfq",
+            "trade_date": str(latest.get("日期") or ""),
+            "profit_ratio": round(profit_ratio, 4),
+            "profit_ratio_pct": round(profit_ratio * 100, 2),
+            "avg_cost": round(avg_cost, 3),
+            "avg_cost_change_5d": round(avg_cost - prev_avg_cost, 3),
+            "cost_90_low": _safe_float(latest.get("90成本-低")),
+            "cost_90_high": _safe_float(latest.get("90成本-高")),
+            "concentration_90": round(concentration_90, 4),
+            "cost_70_low": _safe_float(latest.get("70成本-低")),
+            "cost_70_high": _safe_float(latest.get("70成本-高")),
+            "concentration_70": round(concentration_70, 4),
+            "recent": _safe_records(frame.tail(8), 8),
+        }
+        return result, [_source_ok("stock_cyq_em", len(df))]
+    except Exception as exc:
+        return {"ok": False, "ts_code": code, "error": str(exc)}, [_source_error("stock_cyq_em", exc)]
+
+
+def collect_chip_snapshot(snapshot: dict, max_codes: int = 12) -> tuple[dict, list[dict]]:
+    """Collect qfq chip distribution for a compact list of hot candidates."""
+    status: list[dict] = []
+    rows = []
+    for code in _candidate_codes(snapshot)[:max(1, int(max_codes or 12))]:
+        item, item_status = collect_chip_distribution(code)
+        status.extend(item_status)
+        if item.get("ok"):
+            rows.append(item)
+    return {"items": rows, "candidate_count": len(rows)}, status
+
+
 def collect_policy_snapshot(recency_days: int = 14) -> tuple[dict, list[dict]]:
     try:
         signals = extract_policy_signals(recency_days)
         return signals, [_source_ok("policy_signals", len(signals.get("top_industries", [])))]
     except Exception as exc:
         return {}, [_source_error("policy_signals", exc)]
+
+
+def collect_stock_fundamental_events(ts_code: str, trade_date: str = "", days: int = 365) -> tuple[dict, list[dict]]:
+    """Collect baostock express/forecast events for one stock."""
+    code = normalize_ts_code(ts_code)
+    try:
+        import baostock as bs
+    except Exception as exc:
+        return {"events": [], "ts_code": code}, [_source_error("baostock", exc)]
+    effective_date = resolve_trade_date(trade_date)
+    end_dt = datetime.strptime(effective_date, "%Y%m%d")
+    start_date = (end_dt - timedelta(days=max(30, int(days or 365)))).strftime("%Y-%m-%d")
+    end_date = end_dt.strftime("%Y-%m-%d")
+    lg = bs.login()
+    if getattr(lg, "error_code", "") != "0":
+        return {"events": [], "ts_code": code, "error": getattr(lg, "error_msg", "baostock login failed")}, [
+            {"source": "baostock_login", "ok": False, "error": getattr(lg, "error_msg", "baostock login failed")}
+        ]
+    events = []
+    status: list[dict] = []
+    try:
+        bs_code = _bs_code(code)
+        express = _collect_bs_rows(bs, "query_performance_express_report", bs_code, start_date, end_date)
+        forecast = _collect_bs_rows(bs, "query_forecast_report", bs_code, start_date, end_date)
+        for row in express[-5:]:
+            events.append({"ts_code": code, "type": "performance_express", "data": row})
+        for row in forecast[-5:]:
+            events.append({"ts_code": code, "type": "forecast", "data": row})
+        status.append(_source_ok("baostock_stock_fundamental", len(events)))
+    except Exception as exc:
+        status.append(_source_error(f"baostock_stock_fundamental_{code}", exc))
+    finally:
+        bs.logout()
+    return {"events": _jsonable(events), "ts_code": code, "start_date": start_date, "end_date": end_date}, status
 
 
 def _bs_code(ts_code: str) -> str:
@@ -266,6 +358,23 @@ def collect_fundamental_event_snapshot(trade_date: str, snapshot: dict) -> tuple
     return {"events": _jsonable(events[:30]), "candidate_count": len(codes)}, status
 
 
+def _format_chip_summary(chip: dict) -> str:
+    items = chip.get("items") or []
+    if not items:
+        return "暂无筹码分布数据。"
+    high_profit = [x for x in items if _safe_float(x.get("profit_ratio")) >= 0.7]
+    concentrated = [x for x in items if 0 < _safe_float(x.get("concentration_70")) <= 0.16]
+    leaders = sorted(items, key=lambda x: _safe_float(x.get("profit_ratio")), reverse=True)[:5]
+    leader_text = "、".join(
+        f"{x.get('ts_code')}获利{_safe_float(x.get('profit_ratio_pct')):.1f}%/成本{x.get('avg_cost')}"
+        for x in leaders
+    )
+    return (
+        f"候选股筹码样本{len(items)}只，高获利比例{len(high_profit)}只，"
+        f"70成本集中较紧{len(concentrated)}只。代表: {leader_text or '暂无'}。"
+    )
+
+
 def _extract_json(text: str) -> dict:
     raw = (text or "").strip()
     if not raw:
@@ -302,6 +411,7 @@ def _fallback_structured(snapshot: dict) -> dict:
         "institution_signal": "机构席位数据见龙虎榜摘要。",
         "policy_signal": (snapshot.get("policy", {}) or {}).get("summary", "暂无政策信号摘要。"),
         "fundamental_events": f"候选股业绩事件 {len(snapshot.get('fundamental', {}).get('events', []))} 条。",
+        "chip_signal": _format_chip_summary(snapshot.get("chip_distribution", {})),
         "trade_agent_guidance": "先按市场状态控制仓位，再在热点板块中结合趋势、基本面和流动性筛选。",
         "risk_warnings": ["外部数据可能部分缺失，交易Agent需要对个股继续核验。"],
     }
@@ -353,6 +463,7 @@ def _build_markdown(trade_date: str, structured: dict, snapshot: dict, data_stat
 
 - 政策方向: {structured.get("policy_signal", "")}
 - 业绩事件: {structured.get("fundamental_events", "")}
+- 筹码分布: {structured.get("chip_signal", "")}
 
 ## 给交易 Agent 的指引
 
@@ -442,6 +553,10 @@ def generate_macro_report(trade_date: str = "", force: bool = False) -> dict:
     snapshot["fundamental"] = fundamental
     data_status.extend(status)
 
+    chip, status = collect_chip_snapshot(snapshot, 12)
+    snapshot["chip_distribution"] = chip
+    data_status.extend(status)
+
     llm_error = ""
     structured = {}
     try:
@@ -515,6 +630,120 @@ def generate_macro_report(trade_date: str = "", force: bool = False) -> dict:
         "latency_ms": round(latency_ms, 2),
         "failed_sources": failed,
         "report": row,
+    }
+
+
+def format_chip_distribution(ts_code: str) -> str:
+    item, status = collect_chip_distribution(ts_code)
+    code = item.get("ts_code") or normalize_ts_code(ts_code)
+    if not item.get("ok"):
+        return f"{code} 筹码分布读取失败: {item.get('error') or status[0].get('error') if status else '未知错误'}"
+    recent = item.get("recent") or []
+    trend = "平均成本上移" if _safe_float(item.get("avg_cost_change_5d")) > 0 else ("平均成本下移" if _safe_float(item.get("avg_cost_change_5d")) < 0 else "平均成本稳定")
+    lines = [
+        f"{code} 前复权筹码分布",
+        f"日期: {item.get('trade_date')}",
+        f"- 获利比例: {item.get('profit_ratio_pct')}%",
+        f"- 平均成本: {item.get('avg_cost')}，近5日变化 {item.get('avg_cost_change_5d')}，{trend}",
+        f"- 90%成本区间: {item.get('cost_90_low')}-{item.get('cost_90_high')}，集中度 {item.get('concentration_90')}",
+        f"- 70%成本区间: {item.get('cost_70_low')}-{item.get('cost_70_high')}，集中度 {item.get('concentration_70')}",
+    ]
+    if recent:
+        lines.append("最近样本:")
+        for row in recent[-5:]:
+            lines.append(
+                f"  {row.get('日期')} 获利{_safe_float(row.get('获利比例')) * 100:.1f}% "
+                f"平均成本{_safe_float(row.get('平均成本')):.2f} "
+                f"70集中{_safe_float(row.get('70集中度')):.4f}"
+            )
+    lines.append("解读: 获利比例越高代表上方套牢盘越少，但高位高获利也可能积累兑现压力；集中度越低通常代表筹码更集中。")
+    return "\n".join(lines)
+
+
+def format_macro_topic(topic: str = "report", trade_date: str = "") -> str:
+    effective_date = resolve_trade_date(trade_date)
+    raw = (topic or "report").lower()
+    row = get_macro_report_row(effective_date)
+    snapshot = {}
+    if row and row.get("raw_json"):
+        try:
+            snapshot = json.loads(row["raw_json"] or "{}")
+        except Exception:
+            snapshot = {}
+    if raw in {"report", "macro", "daily"}:
+        return get_macro_daily_report_text(effective_date)
+    if raw in {"sector", "sector_heat", "板块", "板块热度"}:
+        market = snapshot.get("market") if snapshot else collect_market_snapshot(effective_date)[0]
+        temp = market.get("sector_temperature") or {}
+        sectors = temp.get("sectors") or []
+        weak = temp.get("weak_sectors") or []
+        lines = [f"{effective_date} 板块热度", f"市场状态: {temp.get('market_regime', 'unknown')} risk-on {temp.get('risk_on_score', 0)}"]
+        lines.append("热门板块:")
+        for item in sectors[:12]:
+            heat = item.get("temperature_score", item.get("heat_score", 0))
+            avg_pct = item.get("avg_pct_chg", item.get("avg_pct", 0))
+            lines.append(f"- {item.get('sector')}: 温度{heat} 涨停{item.get('limit_up_count')} 大涨{item.get('big_up_count')} 平均涨幅{avg_pct}%")
+        lines.append("风险板块:")
+        for item in weak[:8]:
+            heat = item.get("temperature_score", item.get("heat_score", 0))
+            avg_pct = item.get("avg_pct_chg", item.get("avg_pct", 0))
+            lines.append(f"- {item.get('sector')}: 温度{heat} 跌停{item.get('limit_down_count')} 大跌{item.get('big_down_count')} 平均涨幅{avg_pct}%")
+        return "\n".join(lines)
+    if raw in {"lhb", "龙虎榜"}:
+        lhb = snapshot.get("lhb") if snapshot else collect_lhb_snapshot(effective_date)[0]
+        lines = [f"{effective_date} 龙虎榜摘要", _format_lhb_summary(lhb)]
+        for title, key in (("当日详情", "daily_detail"), ("近5日个股净买入", "stock_stats_5d"), ("机构席位追踪", "institution_track_5d")):
+            lines.append(title + ":")
+            for item in (lhb.get(key, {}).get("top") or [])[:8]:
+                code = item.get("股票代码") or ""
+                name = item.get("股票名称") or ""
+                net = item.get("净额") or item.get("成交额") or item.get("累积买入额") or ""
+                reason = item.get("指标") or item.get("类型") or ""
+                lines.append(f"- {code} {name} {net} {reason}".strip())
+        return "\n".join(lines)
+    limit_map = {
+        "limit_up": ("limit_up_pool", "涨停板"),
+        "涨停": ("limit_up_pool", "涨停板"),
+        "zt": ("limit_up_pool", "涨停板"),
+        "limit_down": ("limit_down_pool", "跌停板"),
+        "跌停": ("limit_down_pool", "跌停板"),
+        "broken_limit": ("broken_limit_up_pool", "涨停炸板"),
+        "炸板": ("broken_limit_up_pool", "涨停炸板"),
+        "strong": ("strong_pool", "强势股池"),
+        "强势": ("strong_pool", "强势股池"),
+    }
+    if raw in limit_map:
+        key, title = limit_map[raw]
+        limit_up = snapshot.get("limit_up") if snapshot else collect_limit_up_snapshot(effective_date)[0]
+        pool = limit_up.get(key) or {}
+        lines = [f"{effective_date} {title}", f"数量: {pool.get('count', 0)}"]
+        for item in (pool.get("top") or [])[:15]:
+            line = (
+                f"- {item.get('代码') or item.get('股票代码') or ''} {item.get('名称') or item.get('股票名称') or ''} "
+                f"涨跌{item.get('涨跌幅', '')}% 换手{item.get('换手率', '')}% 连板{item.get('连板数') or item.get('昨日连板数') or ''} "
+                f"{item.get('所属行业') or ''} {item.get('入选理由') or ''}"
+            )
+            lines.append(line.strip())
+        return "\n".join(lines)
+    return get_macro_daily_report_text(effective_date)
+
+
+def refresh_macro_intelligence(trade_date: str = "", refresh_policy: bool = True, force: bool = True) -> dict:
+    """Manual refresh entry for UI/Telegram tools."""
+    policy_result = None
+    if refresh_policy:
+        try:
+            from backend.policy.crawler import run_policy_crawler
+            result = run_policy_crawler(None, 10, True)
+            policy_result = {"ok": True, "count": len(result)}
+        except Exception as exc:
+            policy_result = {"ok": False, "error": str(exc)}
+    report_result = generate_macro_report(trade_date, force=force)
+    return {
+        "ok": bool(report_result.get("ok")),
+        "trade_date": report_result.get("trade_date"),
+        "policy_refresh": policy_result,
+        "report": report_result,
     }
 
 

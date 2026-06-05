@@ -18,6 +18,7 @@ from backend.telegram.gateway import (
     edit_message_text,
     send_chat_action,
     send_html_message,
+    send_rich_message,
     send_message,
 )
 from backend.telegram.recommender import handle_text_message
@@ -137,7 +138,7 @@ def _handle_update(update: dict):
             chat_type=chat_type,
         )
         progress.finish()
-        result = send_html_message(chat_id, response)
+        result = send_rich_message(chat_id, response, "推荐助手回复")
         if not result.get("ok"):
             _state["last_send_error"] = result.get("error", "")
         else:

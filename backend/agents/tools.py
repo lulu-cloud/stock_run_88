@@ -322,6 +322,35 @@ def get_macro_daily_report(trade_date: str = "") -> str:
 
 
 @tool
+def get_macro_market_topic(topic: str = "report", trade_date: str = "") -> str:
+    """读取每日宏观报告里的指定主题。
+
+    Args:
+        topic: report/sector/lhb/limit_up/limit_down/broken_limit/strong
+        trade_date: 交易日期，空字符串表示最新
+
+    Returns:
+        文本化主题摘要，适合用于交易前二次筛选。
+    """
+    from backend.macro.report import format_macro_topic
+    return format_macro_topic(topic, trade_date)
+
+
+@tool
+def get_stock_chip_distribution(ts_code: str) -> str:
+    """读取个股前复权筹码分布。
+
+    Args:
+        ts_code: 股票代码，如 600000.SH
+
+    Returns:
+        文本化筹码峰/获利比例/成本集中度摘要。
+    """
+    from backend.macro.report import format_chip_distribution
+    return format_chip_distribution(ts_code)
+
+
+@tool
 def get_agent_performance(agent_id: int) -> str:
     """查询实盘 Agent 历史战绩、持仓和近期交易。
 
@@ -674,6 +703,8 @@ AGENT_TOOLS = [
     get_market_breadth,
     get_sector_temperature,
     get_macro_daily_report,
+    get_macro_market_topic,
+    get_stock_chip_distribution,
     get_policy_signals,
     get_agent_performance,
     get_simulation_performance,
@@ -701,6 +732,8 @@ _TOOL_CATEGORIES = {
     "get_market_breadth": "行情",
     "get_sector_temperature": "行情",
     "get_macro_daily_report": "行情",
+    "get_macro_market_topic": "行情",
+    "get_stock_chip_distribution": "行情",
     "get_policy_signals": "政策",
     "get_company_business": "基本面",
     "get_stock_analysis_report": "基本面",
@@ -727,6 +760,7 @@ _MANDATORY_TOOL_NAMES = {
     "get_market_breadth",
     "get_sector_temperature",
     "get_macro_daily_report",
+    "get_macro_market_topic",
     "get_strategy_param_schema",
     "get_agent_stock_pool",
 }
