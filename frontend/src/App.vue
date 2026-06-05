@@ -7,6 +7,7 @@
       </div>
       <div class="nav-links">
         <router-link to="/"><span class="nav-icon">⊟</span>大盘看板</router-link>
+        <router-link to="/macro"><span class="nav-icon">▤</span>板块热度</router-link>
         <router-link to="/chat"><span class="nav-icon">◇</span>AI 选股</router-link>
         <router-link to="/stock"><span class="nav-icon">⬒</span>K线分析</router-link>
         <router-link to="/backtest"><span class="nav-icon">◫</span>策略回测</router-link>

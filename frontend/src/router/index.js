@@ -2,6 +2,7 @@ import { createRouter, createWebHistory } from 'vue-router'
 
 const routes = [
   { path: '/', name: 'Dashboard', component: () => import('../views/Dashboard.vue') },
+  { path: '/macro', name: 'Macro', component: () => import('../views/Macro.vue') },
   { path: '/agent/:id', name: 'AgentDetail', component: () => import('../views/AgentDetail.vue') },
   { path: '/chat', name: 'AIChat', component: () => import('../views/AIChat.vue') },
   { path: '/stock', name: 'StockViewer', component: () => import('../views/StockViewer.vue') },
