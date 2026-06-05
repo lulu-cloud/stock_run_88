@@ -52,6 +52,12 @@ export const marketAPI = {
   stockSearch: (q = '') => api.get(`/market/stocks/search?q=${encodeURIComponent(q)}`),
 }
 
+export const macroAPI = {
+  status: () => api.get('/macro/status'),
+  report: (date = '') => api.get(`/macro/report?trade_date=${date}`),
+  generate: (date = '', force = true) => api.post(`/macro/report/generate?trade_date=${date}&force=${force}`),
+}
+
 export const telegramAPI = {
   status: () => api.get('/telegram/status'),
   bindings: (agentId = '') => api.get(`/telegram/bindings${agentId ? `?agent_id=${agentId}` : ''}`),

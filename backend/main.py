@@ -30,6 +30,14 @@ _stock_universe_state = {
     "refresh_time": os.environ.get("STOCK_UNIVERSE_REFRESH_TIME", "20:30"),
     "min_interval_days": int(os.environ.get("STOCK_UNIVERSE_REFRESH_DAYS", "7")),
 }
+_macro_report_state = {
+    "running": False,
+    "last_check": "",
+    "last_run_date": "",
+    "last_result": None,
+    "last_error": "",
+    "interval_minutes": int(os.environ.get("MACRO_REPORT_INTERVAL_MINUTES", "10")),
+}
 
 
 def _scheduler_loop():
@@ -125,6 +133,39 @@ def _stock_universe_loop():
         time.sleep(_stock_universe_state["interval_minutes"] * 60)
 
 
+def _macro_report_loop():
+    """后台宏观报告：在交易员复盘前生成公共市场日报。"""
+    _macro_report_state["running"] = True
+    print("[MacroReport] 启动，自动推导交易员最早复盘前30分钟运行")
+    while _macro_report_state["running"]:
+        try:
+            now = datetime.now(ZoneInfo("Asia/Shanghai"))
+            _macro_report_state["last_check"] = now.strftime("%Y-%m-%d %H:%M:%S")
+            from backend.macro.report import generate_macro_report, get_effective_macro_report_time
+            from backend.pipeline.daily_pipeline import _latest_trading_day, check_data_freshness
+
+            expected_date = _latest_trading_day(now.date()).strftime("%Y%m%d")
+            report_time = get_effective_macro_report_time()
+            _macro_report_state["report_time"] = report_time
+            if now.strftime("%H:%M") >= report_time and _macro_report_state["last_run_date"] != expected_date:
+                if not check_data_freshness(expected_date):
+                    _macro_report_state["last_result"] = {
+                        "status": "waiting_data",
+                        "trade_date": expected_date,
+                    }
+                else:
+                    result = generate_macro_report(expected_date, force=False)
+                    _macro_report_state["last_result"] = result
+                    _macro_report_state["last_run_date"] = expected_date
+                    _macro_report_state["last_error"] = ""
+                    print(f"[MacroReport] {expected_date} 生成完成: {result.get('status')}")
+        except Exception as e:
+            print(f"[MacroReport] 错误: {e}")
+            _macro_report_state["last_error"] = str(e)
+            _macro_report_state["last_result"] = {"error": str(e)}
+        time.sleep(_macro_report_state["interval_minutes"] * 60)
+
+
 @app.on_event("startup")
 async def startup_init_db():
     """Ensure idempotent SQLite migrations are applied before APIs run."""
@@ -142,6 +183,10 @@ async def startup_init_db():
 
     if os.environ.get("STOCK_UNIVERSE_REFRESH_ENABLED", "1") == "1" and not _stock_universe_state["running"]:
         t = threading.Thread(target=_stock_universe_loop, daemon=True, name="stock-universe")
+        t.start()
+
+    if os.environ.get("MACRO_REPORT_ENABLED", "1") == "1" and not _macro_report_state["running"]:
+        t = threading.Thread(target=_macro_report_loop, daemon=True, name="macro-report")
         t.start()
 
     if os.environ.get("TELEGRAM_POLLING_ENABLED", "1") == "1":
@@ -185,6 +230,7 @@ async def automation_status():
         "scheduler": _scheduler_state,
         "policy": _policy_state,
         "stock_universe": _stock_universe_state,
+        "macro_report": _macro_report_state,
         "market_data": get_data_fetch_state(),
     }
 
@@ -204,6 +250,7 @@ async def shared_stock_report(ts_code: str):
 from backend.api.strategy_routes import router as strategy_router
 from backend.api.agent_routes import router as agent_router
 from backend.api.market_routes import router as market_router
+from backend.api.macro_routes import router as macro_router
 from backend.api.backtest_routes import router as backtest_router
 from backend.api.company_routes import router as company_router
 from backend.api.policy_routes import router as policy_router
@@ -213,6 +260,7 @@ from backend.api.telegram_routes import router as telegram_router
 app.include_router(strategy_router)
 app.include_router(agent_router)
 app.include_router(market_router)
+app.include_router(macro_router)
 app.include_router(backtest_router)
 app.include_router(company_router)
 app.include_router(policy_router)

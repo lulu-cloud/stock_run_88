@@ -1439,6 +1439,16 @@ def run_due_agents(now: datetime | None = None) -> dict:
 
     results["due"] = len(due) + len(push_due)
 
+    if due:
+        try:
+            from backend.macro.report import generate_macro_report, has_usable_macro_report
+            if not has_usable_macro_report(expected_date_str):
+                results["macro_report"] = generate_macro_report(expected_date_str, force=False)
+            else:
+                results["macro_report"] = {"ok": True, "skipped": True, "trade_date": expected_date_str}
+        except Exception as macro_error:
+            results["macro_report"] = {"ok": False, "error": str(macro_error), "trade_date": expected_date_str}
+
     for agent in push_due:
         agent_id = agent["id"]
         agent_name = agent["display_name"]

@@ -199,6 +199,25 @@ CREATE INDEX IF NOT EXISTS idx_order_trace_order ON agent_order_trace(order_id, 
 CREATE INDEX IF NOT EXISTS idx_order_trace_agent ON agent_order_trace(agent_id, trade_date, created_at);
 CREATE INDEX IF NOT EXISTS idx_decision_batch_agent ON agent_decision_batch(agent_id, trade_date);
 CREATE INDEX IF NOT EXISTS idx_shared_context_date ON agent_shared_context(trade_date, agent_id);
+
+CREATE TABLE IF NOT EXISTS macro_daily_report (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_date      TEXT NOT NULL UNIQUE,
+    status          TEXT DEFAULT 'partial',
+    market_regime   TEXT DEFAULT 'unknown',
+    risk_on_score   REAL DEFAULT 0.0,
+    summary         TEXT,
+    report_md       TEXT,
+    report_path     TEXT,
+    raw_json        TEXT DEFAULT '{}',
+    structured_json TEXT DEFAULT '{}',
+    data_status_json TEXT DEFAULT '[]',
+    latency_ms      REAL DEFAULT 0.0,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_macro_report_date ON macro_daily_report(trade_date);
 CREATE INDEX IF NOT EXISTS idx_trade_agent ON agent_trade_log(agent_id, trade_date);
 CREATE INDEX IF NOT EXISTS idx_position_agent ON agent_position(agent_id);
 CREATE INDEX IF NOT EXISTS idx_report_agent ON agent_daily_report(agent_id, trade_date);

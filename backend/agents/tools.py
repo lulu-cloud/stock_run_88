@@ -308,6 +308,20 @@ def get_policy_signals() -> str:
 
 
 @tool
+def get_macro_daily_report(trade_date: str = "") -> str:
+    """读取每日宏观市场报告。
+
+    Args:
+        trade_date: 交易日期，空字符串表示最新报告
+
+    Returns:
+        文本化宏观报告，包含市场状态、热点板块、龙虎榜、涨停池、政策和交易建议。
+    """
+    from backend.macro.report import get_macro_daily_report_text
+    return get_macro_daily_report_text(trade_date)
+
+
+@tool
 def get_agent_performance(agent_id: int) -> str:
     """查询实盘 Agent 历史战绩、持仓和近期交易。
 
@@ -659,6 +673,7 @@ AGENT_TOOLS = [
     get_market_strength_sectors,
     get_market_breadth,
     get_sector_temperature,
+    get_macro_daily_report,
     get_policy_signals,
     get_agent_performance,
     get_simulation_performance,
@@ -685,6 +700,7 @@ _TOOL_CATEGORIES = {
     "get_market_strength_sectors": "行情",
     "get_market_breadth": "行情",
     "get_sector_temperature": "行情",
+    "get_macro_daily_report": "行情",
     "get_policy_signals": "政策",
     "get_company_business": "基本面",
     "get_stock_analysis_report": "基本面",
@@ -710,6 +726,7 @@ _MANDATORY_TOOL_NAMES = {
     "get_evolution_context",
     "get_market_breadth",
     "get_sector_temperature",
+    "get_macro_daily_report",
     "get_strategy_param_schema",
     "get_agent_stock_pool",
 }

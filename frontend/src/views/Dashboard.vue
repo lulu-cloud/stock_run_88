@@ -194,6 +194,49 @@
       </div>
     </div>
 
+    <div class="card macro-card" style="margin-bottom:24px" v-if="!loadError">
+      <div class="card-header-row">
+        <div>
+          <h3>每日宏观报告</h3>
+          <span class="small-muted" v-if="macroReport">
+            {{ macroReport.trade_date }} · {{ macroReport.status }} · {{ macroReport.market_regime }} · risk-on {{ score(macroReport.risk_on_score) }}
+          </span>
+          <span class="small-muted" v-else>{{ macroLoading ? '正在生成公共市场日报' : '暂无报告，可手动生成' }}</span>
+        </div>
+        <button class="btn btn-sm btn-primary" @click="generateMacroReport" :disabled="macroLoading">
+          {{ macroLoading ? '生成中...' : '重新生成' }}
+        </button>
+      </div>
+      <div v-if="macroReport" class="macro-grid">
+        <div class="macro-panel">
+          <div class="cfg-title">市场摘要</div>
+          <p class="macro-summary">{{ macroStructured.summary || macroReport.summary || '暂无摘要' }}</p>
+          <div class="breadth-line">
+            <span v-for="s in (macroStructured.hot_sectors || []).slice(0,8)" :key="s">热 {{ s }}</span>
+          </div>
+          <div class="breadth-line">
+            <span v-for="s in (macroStructured.risk_sectors || []).slice(0,6)" :key="s">险 {{ s }}</span>
+          </div>
+        </div>
+        <div class="macro-panel">
+          <div class="cfg-title">情绪 / 政策 / 指引</div>
+          <p>{{ macroStructured.limit_up_summary || '-' }}</p>
+          <p>{{ macroStructured.lhb_summary || '-' }}</p>
+          <p>{{ macroStructured.policy_signal || '-' }}</p>
+          <p class="macro-guidance">{{ macroStructured.trade_agent_guidance || '-' }}</p>
+        </div>
+      </div>
+      <details v-if="macroReport?.report_md" class="macro-details">
+        <summary>查看完整报告</summary>
+        <div class="md-content" v-html="renderMD(macroReport.report_md)"></div>
+      </details>
+      <div class="data-quality" v-if="macroDataStatus.length">
+        <span v-for="s in macroDataStatus.slice(0,18)" :key="s.source" :class="s.ok ? 'ok' : 'fail'">
+          {{ s.source }} {{ s.ok ? 'ok' : 'fail' }}
+        </span>
+      </div>
+    </div>
+
     <div class="grid-2" style="margin-bottom:24px" v-if="!loadError">
       <div class="card">
         <h3>上证指数</h3>
@@ -313,7 +356,7 @@
 import { ref, computed, onMounted, nextTick } from 'vue'
 import * as echarts from 'echarts'
 import { marked } from 'marked'
-import { agentAPI, marketAPI, policyAPI, strategyAPI } from '../api'
+import { agentAPI, marketAPI, policyAPI, strategyAPI, macroAPI } from '../api'
 
 const agents = ref([]); const indexChart = ref(null); const trendChart = ref(null)
 const pnlCalendar = ref([])
@@ -367,6 +410,8 @@ const sectorStrength = ref(null)
 const marketBreadth = ref(null)
 const sectorTemperature = ref(null)
 const positionOverview = ref([])
+const macroReport = ref(null)
+const macroLoading = ref(false)
 const showPolicyModal = ref(false); const selectedPolicy = ref(null); const policyContent = ref('')
 const policyDept = ref('')
 const deptOptions = [
@@ -383,6 +428,11 @@ function money(value) {
 }
 function score(value) { return Number(value || 0).toFixed(2) }
 function signedPct(value) { const n=Number(value||0); return `${n>=0?'+':''}${n.toFixed(2)}%` }
+function parseJSONSafe(raw, fallback) {
+  try { return raw ? JSON.parse(raw) : fallback } catch(e) { return fallback }
+}
+const macroStructured = computed(() => parseJSONSafe(macroReport.value?.structured_json, {}))
+const macroDataStatus = computed(() => parseJSONSafe(macroReport.value?.data_status_json, []))
 const groupedTools = computed(() => {
   const groups = {}
   for (const t of toolCatalog.value) {
@@ -455,6 +505,25 @@ async function viewPolicy(p) {
   try { const r=await policyAPI.content(p.source_dir,p.filename); policyContent.value=renderMD(r.data.content||'') } catch(e){policyContent.value='加载失败'}
 }
 
+async function loadMacroReport() {
+  try {
+    const r = await macroAPI.report('')
+    macroReport.value = r.data.exists ? r.data : null
+  } catch(e) {
+    macroReport.value = null
+  }
+}
+
+async function generateMacroReport() {
+  macroLoading.value = true
+  try {
+    const r = await macroAPI.generate('', true)
+    macroReport.value = r.data.report?.exists ? r.data.report : null
+  } finally {
+    macroLoading.value = false
+  }
+}
+
 async function loadData() {
   loadError.value = ''
   let aRes, mRes
@@ -465,6 +534,7 @@ async function loadData() {
     return
   }
   agents.value=aRes.data.agents; loadPolicyData()
+  loadMacroReport()
   agentAPI.tools().then(r => {
     toolCatalog.value = r.data.tools || []
     if (!createForm.value.allowed_tools.length) selectAllTools()
@@ -664,6 +734,18 @@ onMounted(loadData)
 .ps { font-size:10px; color:var(--text-dim); white-space:nowrap; }
 
 .small-muted { color: var(--text-dim); font-size: 11px; font-family: var(--font-mono); }
+.macro-card { overflow:hidden; }
+.macro-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+.macro-panel { border:1px solid var(--border); background:var(--bg-deep); border-radius:6px; padding:12px; min-width:0; }
+.macro-panel p { margin:0 0 8px; color:var(--text-secondary); font-size:12px; line-height:1.7; }
+.macro-summary { color:var(--text-primary) !important; }
+.macro-guidance { color:var(--accent-cyan) !important; }
+.macro-details { margin-top:12px; border-top:1px solid var(--border); padding-top:10px; }
+.macro-details summary { cursor:pointer; font-size:12px; color:var(--accent-gold); margin-bottom:8px; }
+.data-quality { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
+.data-quality span { font-size:10px; border-radius:4px; padding:3px 6px; border:1px solid var(--border); color:var(--text-dim); }
+.data-quality span.ok { background:rgba(5,150,105,0.05); color:var(--accent-green); border-color:rgba(5,150,105,0.15); }
+.data-quality span.fail { background:rgba(220,38,38,0.04); color:var(--accent-red); border-color:rgba(220,38,38,0.14); }
 .sector-list { display:flex; flex-direction:column; gap:8px; }
 .sector-row { border:1px solid rgba(220,38,38,0.10); background:rgba(220,38,38,0.035); border-radius:6px; padding:9px 10px; }
 .sector-row.weak { border-color:rgba(5,150,105,0.10); background:rgba(5,150,105,0.025); }
@@ -717,6 +799,6 @@ onMounted(loadData)
 .stage-grid { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:8px; }
 .stage-grid label span { display:block; font-size:11px; color:var(--text-dim); margin-bottom:4px; }
 .stage-grid textarea { width:100%; min-height:70px; resize:vertical; font-size:12px; }
-@media (max-width: 1000px) { .create-grid { grid-template-columns:1fr 1fr; } }
+@media (max-width: 1000px) { .create-grid { grid-template-columns:1fr 1fr; } .macro-grid { grid-template-columns:1fr; } }
 @media (max-width: 1000px) { .config-board, .stage-grid, .tool-groups { grid-template-columns:1fr; } }
 </style>
