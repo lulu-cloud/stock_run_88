@@ -35,18 +35,24 @@ def send_message(chat_id: str, text: str, parse_mode: str = "") -> dict:
 
 def to_telegram_html(text: str) -> str:
     """Convert the project's simple Markdown-ish text to Telegram HTML."""
-    escaped = html.escape(text or "")
-    escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
-    escaped = re.sub(r"(?m)^\*([^*\n]+)\*$", r"<b>\1</b>", escaped)
-    escaped = re.sub(r"(?m)^-\s+\*([^*\n]+)\*", r"- <b>\1</b>", escaped)
-    return escaped
+    from backend.telegram.rendering import markdown_to_telegram_html
+
+    return markdown_to_telegram_html(text or "")
 
 
 def send_html_message(chat_id: str, text: str) -> dict:
-    result = send_message(chat_id, to_telegram_html(text), parse_mode="HTML")
-    if result.get("ok"):
-        return result
-    return send_message(chat_id, text)
+    from backend.telegram.rendering import telegram_html_chunks
+
+    chunks = telegram_html_chunks(text or "")
+    results = []
+    for chunk in chunks:
+        result = send_message(chat_id, chunk, parse_mode="HTML")
+        if not result.get("ok"):
+            result = send_message(chat_id, re.sub(r"<[^>]+>", "", chunk))
+        results.append(result)
+    if len(results) == 1:
+        return results[0]
+    return {"ok": all(r.get("ok") for r in results), "result": results}
 
 
 def _multipart_request(method: str, fields: dict, file_field: str, file_path: str) -> dict:
@@ -99,14 +105,18 @@ def send_photo(chat_id: str, file_path: str, caption: str = "") -> dict:
 
 
 def send_rich_message(chat_id: str, text: str, title: str = "分析报告") -> dict:
-    """Send simple replies as Telegram HTML and complex Markdown as PNG/HTML artifact."""
-    from backend.telegram.rendering import is_complex_markdown, render_markdown_png, write_html_report
+    """Send rich replies.
 
-    if not is_complex_markdown(text):
-        return send_html_message(chat_id, text)
+    Default is native Telegram HTML because it is the best chat UX. Set
+    TELEGRAM_RICH_RENDER_MODE=photo/document to force artifact rendering.
+    """
+    from backend.telegram.rendering import render_markdown_png, write_html_report
+
     caption = f"{title}\n复杂 Markdown/表格已渲染为附件。"
-    render_mode = os.environ.get("TELEGRAM_RICH_RENDER_MODE", "photo").lower()
-    if render_mode != "document":
+    render_mode = os.environ.get("TELEGRAM_RICH_RENDER_MODE", "native").lower()
+    if render_mode in ("native", "html", "telegram"):
+        return send_html_message(chat_id, text)
+    if render_mode == "photo":
         try:
             png_path = render_markdown_png(text, title)
             result = send_photo(chat_id, png_path, caption)
@@ -114,14 +124,26 @@ def send_rich_message(chat_id: str, text: str, title: str = "分析报告") -> d
                 return result
         except Exception:
             pass
+    if render_mode in ("document", "html_file", "photo"):
+        try:
+            html_path = write_html_report(text, title)
+            result = send_document(chat_id, html_path, caption)
+            if result.get("ok"):
+                return result
+        except Exception:
+            pass
+    return send_html_message(chat_id, text)
+
+
+def send_report_document(chat_id: str, text: str, title: str = "分析报告") -> dict:
+    """Explicitly send a rendered HTML document for long archive-style reports."""
+    from backend.telegram.rendering import write_html_report
+
     try:
         html_path = write_html_report(text, title)
-        result = send_document(chat_id, html_path, caption)
-        if result.get("ok"):
-            return result
+        return send_document(chat_id, html_path, title[:1000])
     except Exception:
-        pass
-    return send_html_message(chat_id, text[:3900])
+        return send_html_message(chat_id, text)
 
 
 def edit_message_text(chat_id: str, message_id: int, text: str, parse_mode: str = "") -> dict:

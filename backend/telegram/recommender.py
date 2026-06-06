@@ -464,6 +464,22 @@ def _format_refresh_reply(raw: str) -> str:
     return "\n".join(lines)
 
 
+def _render_test_reply() -> str:
+    return """# Telegram 渲染测试
+
+**这条消息包含 Markdown 表格，但会被自动转换成手机友好的列表块。**
+
+| 板块 | 温度 | 涨停 | 大涨 | 风险 |
+| --- | ---: | ---: | ---: | --- |
+| 白酒 | 68.84 | 1 | 2 | 低 |
+| 医药 | 53.48 | 4 | 7 | 中 |
+| 半导体 | -61.57 | 0 | 1 | 高 |
+
+- 如果你看到的是加粗标题和逐行字段，说明 Telegram 原生 HTML 渲染正常。
+- 如果你看到原始 `| --- |` 表格，说明发送链路没有走新的渲染器。
+"""
+
+
 def _identity_reply(chat_id: str, user_id: str = "", thread_id: str = "default") -> str:
     from backend.evolution.memory import read_telegram_memory
 
@@ -1215,6 +1231,9 @@ def _handle_text_message_inner(
             deleted = forget_memories_by_keyword(keyword, chat_id or "local", user_id, thread_id)
             return f"已删除 {deleted} 条匹配记忆。" if keyword else "用法: /memory forget 关键词，或 /memory forget #12"
         return format_memory_overview(chat_id or "local", user_id, thread_id)
+
+    if lower.startswith("/render_test") or raw in {"渲染测试", "telegram渲染测试"}:
+        return _render_test_reply()
 
     if any(token in raw for token in ("记住", "记一下", "帮我记")):
         return "已写入当前用户/会话记忆。你可以用 /memory 查看，或 /memory forget 关键词 删除。"
