@@ -16,7 +16,7 @@ from backend.search_agent.searcher import get_cached, get_freshness
 from backend.trading.rules import is_index_like_name, normalize_ts_code
 
 
-CODE_RE = re.compile(r"\b(?:60\d{4}|000\d{3}|001\d{3}|002\d{3})(?:\.(?:SH|SZ))?\b", re.I)
+CODE_RE = re.compile(r"(?<!\d)(?:60\d{4}|000\d{3}|001\d{3}|002\d{3})(?:\.(?:SH|SZ))?(?!\d)", re.I)
 
 
 def extract_stock_codes(text: str) -> list[str]:

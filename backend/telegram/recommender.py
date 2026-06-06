@@ -712,7 +712,7 @@ def recommend_get_market_topic(topic: str = "report", trade_date: str = "") -> s
 
 @tool
 def recommend_get_stock_chip_distribution(ts_code: str) -> str:
-    """读取个股前复权筹码峰/筹码分布，包括获利比例、平均成本和成本集中度。"""
+    """模拟个股前复权筹码峰/筹码分布，包括获利比例、平均成本和成本集中度。"""
     codes = extract_stock_mentions(ts_code) or [ts_code]
     return format_chip_distribution(codes[0])
 

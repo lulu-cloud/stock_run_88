@@ -23,7 +23,7 @@ from backend.data.indicators import (
     compute_market_strength_by_sector,
     compute_sector_temperature,
 )
-from backend.data.loader import load_index_daily
+from backend.data.loader import load_daily, load_index_daily
 from backend.db.repository import get_conn, get_read_conn
 from backend.llm.client import chat
 from backend.policy.reader import extract_policy_signals
@@ -195,56 +195,220 @@ def collect_lhb_snapshot(trade_date: str) -> tuple[dict, list[dict]]:
     return result, status
 
 
+def _weighted_quantile_from_dist(dist: dict[float, float], quantiles: list[float]) -> list[float]:
+    rows = sorted((float(price), float(weight)) for price, weight in dist.items() if float(weight) > 0)
+    total = sum(weight for _, weight in rows)
+    if not rows or total <= 0:
+        return [0.0 for _ in quantiles]
+    result = []
+    acc = 0.0
+    qi = 0
+    sorted_q = sorted((q, idx) for idx, q in enumerate(quantiles))
+    out = [0.0 for _ in quantiles]
+    for price, weight in rows:
+        acc += weight
+        pct = acc / total
+        while qi < len(sorted_q) and pct >= sorted_q[qi][0]:
+            out[sorted_q[qi][1]] = price
+            qi += 1
+    for i, value in enumerate(out):
+        if value <= 0:
+            out[i] = rows[-1][0]
+    return out
+
+
+def _chip_bucket(price: float, bin_size: float = 0.05) -> float:
+    if price >= 100:
+        bin_size = 0.10
+    if price < 10:
+        bin_size = 0.02
+    return round(round(float(price) / bin_size) * bin_size, 2)
+
+
+def _add_chip_weight(dist: dict[float, float], price: float, weight: float) -> None:
+    price = _safe_float(price)
+    weight = _safe_float(weight)
+    if price <= 0 or weight <= 0:
+        return
+    key = _chip_bucket(price)
+    dist[key] = dist.get(key, 0.0) + weight
+
+
+def _daily_chip_points(row: dict | pd.Series) -> list[tuple[float, float]]:
+    open_p = _safe_float(row.get("open"))
+    high = _safe_float(row.get("high"))
+    low = _safe_float(row.get("low"))
+    close = _safe_float(row.get("close"))
+    typical = (high + low + close) / 3 if high > 0 and low > 0 and close > 0 else close
+    points = [(open_p, 0.12), (high, 0.10), (low, 0.10), (typical, 0.28), (close, 0.40)]
+    points = [(p, w) for p, w in points if p > 0]
+    total = sum(w for _, w in points) or 1.0
+    return [(p, w / total) for p, w in points]
+
+
+def _minute_chip_points(ts_code: str, trade_date: str) -> tuple[list[tuple[float, float]], str]:
+    try:
+        from backend.evolution.minute_replay import load_or_fetch_5m
+
+        df, source = load_or_fetch_5m(ts_code, trade_date)
+    except Exception as exc:
+        return [], f"minute_error:{exc}"
+    if df is None or df.empty:
+        return [], source
+    points = []
+    for _, row in df.iterrows():
+        vol = _safe_float(row.get("vol"))
+        high = _safe_float(row.get("high"))
+        low = _safe_float(row.get("low"))
+        close = _safe_float(row.get("close"))
+        price = (high + low + close) / 3 if high > 0 and low > 0 and close > 0 else close
+        if price > 0 and vol > 0:
+            points.append((price, vol))
+    total = sum(w for _, w in points) or 0.0
+    if total <= 0:
+        return [], source
+    return [(p, w / total) for p, w in points], source
+
+
+def _chip_snapshot_from_dist(dist: dict[float, float], close: float) -> dict:
+    total = sum(dist.values())
+    if total <= 0:
+        return {}
+    prices = list(dist.keys())
+    weights = list(dist.values())
+    avg_cost = sum(price * weight for price, weight in zip(prices, weights)) / total
+    profit_ratio = sum(weight for price, weight in zip(prices, weights) if price <= close) / total if close > 0 else 0.0
+    q05, q15, q85, q95 = _weighted_quantile_from_dist(dist, [0.05, 0.15, 0.85, 0.95])
+    concentration_90 = (q95 - q05) / (q95 + q05) if (q95 + q05) > 0 else 0.0
+    concentration_70 = (q85 - q15) / (q85 + q15) if (q85 + q15) > 0 else 0.0
+    peaks = sorted(dist.items(), key=lambda item: item[1], reverse=True)[:10]
+    return {
+        "avg_cost": round(avg_cost, 3),
+        "profit_ratio": round(profit_ratio, 4),
+        "profit_ratio_pct": round(profit_ratio * 100, 2),
+        "cost_90_low": round(q05, 3),
+        "cost_90_high": round(q95, 3),
+        "concentration_90": round(concentration_90, 4),
+        "cost_70_low": round(q15, 3),
+        "cost_70_high": round(q85, 3),
+        "concentration_70": round(concentration_70, 4),
+        "top_peaks": [{"price": round(price, 3), "weight": round(weight / total, 4)} for price, weight in peaks],
+    }
+
+
+def simulate_chip_distribution(
+    ts_code: str,
+    lookback_days: int = 260,
+    prefer_minute: bool = True,
+    minute_days: int = 8,
+) -> dict:
+    """Approximate chip distribution from qfq daily/5m K lines."""
+    code = normalize_ts_code(ts_code)
+    df = load_daily(code)
+    if df is None or df.empty:
+        return {"ok": False, "ts_code": code, "error": "未找到日线数据"}
+    data = df.sort_values("trade_date").tail(max(30, int(lookback_days or 260))).copy()
+    minute_dates = set(str(x) for x in data.tail(max(0, int(minute_days or 0)))["trade_date"]) if prefer_minute else set()
+    dist: dict[float, float] = {}
+    recent = []
+    minute_used = 0
+    minute_sources: dict[str, int] = {}
+    turnover_values = []
+    for _, row in data.iterrows():
+        trade_date = str(row.get("trade_date"))
+        turnover = _safe_float(row.get("turnover_rate")) / 100.0
+        if turnover <= 0:
+            turnover = 0.005
+        turnover = max(0.001, min(turnover, 0.95))
+        turnover_values.append(turnover)
+        for key in list(dist):
+            dist[key] *= (1 - turnover)
+            if dist[key] < 1e-10:
+                del dist[key]
+        points = []
+        if trade_date in minute_dates:
+            points, source = _minute_chip_points(code, trade_date)
+            minute_sources[source] = minute_sources.get(source, 0) + 1
+            if points:
+                minute_used += 1
+        if not points:
+            points = _daily_chip_points(row)
+        for price, weight in points:
+            _add_chip_weight(dist, price, turnover * weight)
+        total = sum(dist.values())
+        if total > 0:
+            for key in list(dist):
+                dist[key] /= total
+        close = _safe_float(row.get("close"))
+        snapshot = _chip_snapshot_from_dist(dist, close)
+        if snapshot:
+            recent.append({
+                "日期": trade_date,
+                "获利比例": snapshot["profit_ratio"],
+                "平均成本": snapshot["avg_cost"],
+                "70集中度": snapshot["concentration_70"],
+            })
+    latest = data.iloc[-1]
+    close = _safe_float(latest.get("close"))
+    snapshot = _chip_snapshot_from_dist(dist, close)
+    if not snapshot:
+        return {"ok": False, "ts_code": code, "error": "无法形成筹码分布"}
+    prev_snapshot = recent[-6] if len(recent) >= 6 else (recent[0] if recent else {})
+    avg_turnover = sum(turnover_values[-20:]) / max(1, len(turnover_values[-20:]))
+    if minute_used >= 3:
+        confidence = "high"
+    elif avg_turnover >= 0.03 or len(data) >= 180:
+        confidence = "medium"
+    else:
+        confidence = "low"
+    source = "simulated_5m_enhanced" if minute_used else "simulated_daily"
+    return {
+        "ok": True,
+        "ts_code": code,
+        "source": source,
+        "source_adjust": "qfq",
+        "model": "turnover_decay_volume_weighted",
+        "confidence": confidence,
+        "trade_date": str(latest.get("trade_date")),
+        "close": round(close, 3),
+        "lookback_days": len(data),
+        "minute_days_requested": len(minute_dates),
+        "minute_days_used": minute_used,
+        "minute_sources": minute_sources,
+        "bins": len(dist),
+        "avg_cost_change_5d": round(snapshot["avg_cost"] - _safe_float(prev_snapshot.get("平均成本")), 3),
+        "recent": recent[-8:],
+        **snapshot,
+    }
+
+
 def collect_chip_distribution(ts_code: str) -> tuple[dict, list[dict]]:
-    """Collect qfq chip distribution for one stock from Eastmoney/AkShare."""
+    """Simulate qfq chip distribution from daily bars and optional 5m bars.
+
+    The old Eastmoney stock_cyq_em endpoint is unstable/blocked. This model
+    treats turnover_rate as the replacement ratio of old holders by new traded
+    chips. Daily bars provide a coarse OHLC price distribution; for the latest
+    touched stocks, 5-minute bars are fetched on demand and weighted by volume.
+    """
     code = normalize_ts_code(ts_code)
     try:
-        ak = _load_akshare()
+        result = simulate_chip_distribution(code, lookback_days=260, prefer_minute=True, minute_days=8)
+        return result, [_source_ok(result.get("source", "simulated_chip"), result.get("bins", 0))]
     except Exception as exc:
-        return {"ok": False, "ts_code": code, "error": str(exc)}, [_source_error("akshare_cyq", exc)]
-    try:
-        df = ak.stock_cyq_em(symbol=_plain_code(code), adjust="qfq")
-        if df is None or df.empty:
-            return {"ok": False, "ts_code": code, "error": "筹码分布为空"}, [_source_ok("stock_cyq_em", 0)]
-        frame = df.copy()
-        latest = frame.iloc[-1].to_dict()
-        prev = frame.iloc[-6].to_dict() if len(frame) >= 6 else frame.iloc[0].to_dict()
-        avg_cost = _safe_float(latest.get("平均成本"))
-        prev_avg_cost = _safe_float(prev.get("平均成本"))
-        profit_ratio = _safe_float(latest.get("获利比例"))
-        concentration_90 = _safe_float(latest.get("90集中度"))
-        concentration_70 = _safe_float(latest.get("70集中度"))
-        result = {
-            "ok": True,
-            "ts_code": code,
-            "source_adjust": "qfq",
-            "trade_date": str(latest.get("日期") or ""),
-            "profit_ratio": round(profit_ratio, 4),
-            "profit_ratio_pct": round(profit_ratio * 100, 2),
-            "avg_cost": round(avg_cost, 3),
-            "avg_cost_change_5d": round(avg_cost - prev_avg_cost, 3),
-            "cost_90_low": _safe_float(latest.get("90成本-低")),
-            "cost_90_high": _safe_float(latest.get("90成本-高")),
-            "concentration_90": round(concentration_90, 4),
-            "cost_70_low": _safe_float(latest.get("70成本-低")),
-            "cost_70_high": _safe_float(latest.get("70成本-高")),
-            "concentration_70": round(concentration_70, 4),
-            "recent": _safe_records(frame.tail(8), 8),
-        }
-        return result, [_source_ok("stock_cyq_em", len(df))]
-    except Exception as exc:
-        return {"ok": False, "ts_code": code, "error": str(exc)}, [_source_error("stock_cyq_em", exc)]
+        return {"ok": False, "ts_code": code, "error": str(exc)}, [_source_error("simulated_chip", exc)]
 
 
 def collect_chip_snapshot(snapshot: dict, max_codes: int = 12) -> tuple[dict, list[dict]]:
-    """Collect qfq chip distribution for a compact list of hot candidates."""
+    """Collect daily-only simulated chip distribution for hot candidates."""
     status: list[dict] = []
     rows = []
     for code in _candidate_codes(snapshot)[:max(1, int(max_codes or 12))]:
-        item, item_status = collect_chip_distribution(code)
-        status.extend(item_status)
-        if item.get("ok"):
+        try:
+            item = simulate_chip_distribution(code, lookback_days=260, prefer_minute=False, minute_days=0)
+            status.append(_source_ok("simulated_chip_daily", item.get("bins", 0)))
             rows.append(item)
+        except Exception as exc:
+            status.append(_source_error(f"simulated_chip_daily_{code}", exc))
     return {"items": rows, "candidate_count": len(rows)}, status
 
 
@@ -640,14 +804,22 @@ def format_chip_distribution(ts_code: str) -> str:
         return f"{code} 筹码分布读取失败: {item.get('error') or status[0].get('error') if status else '未知错误'}"
     recent = item.get("recent") or []
     trend = "平均成本上移" if _safe_float(item.get("avg_cost_change_5d")) > 0 else ("平均成本下移" if _safe_float(item.get("avg_cost_change_5d")) < 0 else "平均成本稳定")
+    source_text = "5分钟增强" if item.get("source") == "simulated_5m_enhanced" else "日线近似"
+    confidence = {"high": "高", "medium": "中", "low": "低"}.get(item.get("confidence"), item.get("confidence") or "未知")
     lines = [
-        f"{code} 前复权筹码分布",
-        f"日期: {item.get('trade_date')}",
+        f"{code} 模拟筹码分布",
+        f"日期: {item.get('trade_date')}，数据源: {source_text}，置信度: {confidence}",
+        f"- 模型: 换手率衰减 + 成交价格加权；前复权口径；近{item.get('lookback_days')}个交易日",
+        f"- 5分钟K线: 请求{item.get('minute_days_requested', 0)}天，实际使用{item.get('minute_days_used', 0)}天",
         f"- 获利比例: {item.get('profit_ratio_pct')}%",
         f"- 平均成本: {item.get('avg_cost')}，近5日变化 {item.get('avg_cost_change_5d')}，{trend}",
         f"- 90%成本区间: {item.get('cost_90_low')}-{item.get('cost_90_high')}，集中度 {item.get('concentration_90')}",
         f"- 70%成本区间: {item.get('cost_70_low')}-{item.get('cost_70_high')}，集中度 {item.get('concentration_70')}",
     ]
+    peaks = item.get("top_peaks") or []
+    if peaks:
+        peak_text = "、".join(f"{p.get('price')}({float(p.get('weight') or 0) * 100:.1f}%)" for p in peaks[:6])
+        lines.append(f"- 主要筹码峰: {peak_text}")
     if recent:
         lines.append("最近样本:")
         for row in recent[-5:]:
@@ -657,6 +829,7 @@ def format_chip_distribution(ts_code: str) -> str:
                 f"70集中{_safe_float(row.get('70集中度')):.4f}"
             )
     lines.append("解读: 获利比例越高代表上方套牢盘越少，但高位高获利也可能积累兑现压力；集中度越低通常代表筹码更集中。")
+    lines.append("注意: 这是基于日线/5分钟K线的模拟筹码，不是东方财富真实筹码分布，只能作为辅助证据。")
     return "\n".join(lines)
 
 

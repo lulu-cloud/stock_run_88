@@ -338,13 +338,13 @@ def get_macro_market_topic(topic: str = "report", trade_date: str = "") -> str:
 
 @tool
 def get_stock_chip_distribution(ts_code: str) -> str:
-    """读取个股前复权筹码分布。
+    """模拟个股前复权筹码分布。
 
     Args:
         ts_code: 股票代码，如 600000.SH
 
     Returns:
-        文本化筹码峰/获利比例/成本集中度摘要。
+        文本化模拟筹码峰/获利比例/成本集中度摘要。
     """
     from backend.macro.report import format_chip_distribution
     return format_chip_distribution(ts_code)
