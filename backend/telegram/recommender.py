@@ -1199,8 +1199,20 @@ def _run_recommend_loop(
 ) -> tuple[dict, list[dict], float, bool]:
     llm = _build_recommend_llm()
     profile_key = _context_key(chat_id or "local", user_id)
+    if progress_callback:
+        progress_callback({"type": "phase", "message": "读取用户画像，匹配风险偏好和常用周期。"})
     profile = apply_inferred_preferences(profile_key, user_input, username)
+    if progress_callback:
+        progress_callback({"type": "phase", "message": "加载短期上下文、中期会话摘要和长期记忆。"})
     memory_context = build_memory_prompt(chat_id or "local", user_id, thread_id, user_input, None, 8)
+    if progress_callback:
+        progress_callback({
+            "type": "memory_context",
+            "short_count": len(memory_context.get("short_term_messages") or []),
+            "memory_count": len(memory_context.get("long_term_memories") or []),
+            "has_session_summary": bool((memory_context.get("session_summary") or {}).get("summary")),
+        })
+        progress_callback({"type": "phase", "message": "启动 ReAct 工具循环，按证据生成回复。"})
     result = ReActLoop(
         llm,
         RECOMMEND_TOOLS,
@@ -1252,6 +1264,8 @@ def run_recommend_react_agent(
     query = raw.split(maxsplit=1)[1] if raw.lower().startswith("/recommend") and len(raw.split(maxsplit=1)) > 1 else raw
     context = best_public_agent_context()
     if _is_simple_recommend_query(query):
+        if progress_callback:
+            progress_callback({"type": "phase", "message": "问题较明确，使用快速规则链先筛选候选股票。"})
         return _run_rule_recommendation(
             query,
             chat_id or "local",
@@ -1265,6 +1279,8 @@ def run_recommend_react_agent(
     tool_trace: list[dict] = []
     rate = _check_recommend_rate_limit(_context_key(chat_id or "local", user_id))
     if not rate.get("ok"):
+        if progress_callback:
+            progress_callback({"type": "phase", "message": "触发频率限制，切换到低成本规则链回复。"})
         result = _run_rule_recommendation(
             query,
             chat_id or "local",
@@ -1333,6 +1349,8 @@ def run_recommend_react_agent(
             "trace": trace,
         }
     except Exception as exc:
+        if progress_callback:
+            progress_callback({"type": "phase", "message": "ReAct 输出不可用，切换到规则链兜底。"})
         result = _run_rule_recommendation(
             query,
             chat_id or "local",
@@ -1362,6 +1380,9 @@ def handle_text_message(
     """Record scoped memory around the existing Telegram text parser."""
     raw = (text or "").strip()
     intent = _guess_intent(raw)
+    if progress_callback:
+        progress_callback({"type": "intent", "intent": intent})
+        progress_callback({"type": "phase", "message": "记录当前对话，并更新可复用记忆。"})
     message_id = record_message(
         chat_id or "local",
         user_id=user_id or "",
@@ -1381,6 +1402,8 @@ def handle_text_message(
         source_message_id=message_id,
         intent=intent,
     )
+    if progress_callback:
+        progress_callback({"type": "phase", "message": "根据问题类型选择规则链或 ReAct 工具链。"})
     reply = _handle_text_message_inner(
         text,
         chat_id,

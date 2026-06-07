@@ -189,6 +189,13 @@ class ReActLoop:
 
             tool_calls = getattr(response, "tool_calls", None) or []
             has_content = bool(str(response.content or "").strip())
+            self._emit_event(event_callback, {
+                "type": "llm_decision",
+                "turn": turn + 1,
+                "tool_count": len(tool_calls),
+                "tools": [tc.get("name", "") for tc in tool_calls],
+                "has_visible_content": has_content,
+            })
             if not tool_calls and not has_content:
                 empty_rounds += 1
                 self._append_trace(trace, log_path, {
@@ -203,6 +210,11 @@ class ReActLoop:
             else:
                 empty_rounds = 0
             if not tool_calls:
+                self._emit_event(event_callback, {
+                    "type": "finalizing",
+                    "turn": turn + 1,
+                    "reason": "no_more_tool_calls",
+                })
                 break
             if turn == max_turns - 1:
                 reached_tool_limit = True
@@ -261,6 +273,11 @@ class ReActLoop:
                 messages.append(ToolMessage(content=result_text, tool_call_id=tool_id))
 
         if reached_tool_limit and final_instruction:
+            self._emit_event(event_callback, {
+                "type": "finalizing",
+                "turn": max_turns + 1,
+                "reason": "tool_limit",
+            })
             messages.append(HumanMessage(content=final_instruction))
             try:
                 response, llm_latency_ms, attempts, llm_error = invoke_llm_with_retry(self.llm, messages, log_path)

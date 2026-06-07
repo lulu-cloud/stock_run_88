@@ -43,6 +43,7 @@ class _TelegramProgress:
         self.message_id = 0
         self.lines: list[str] = []
         self.last_edit_at = 0.0
+        self.last_line = ""
 
     def start(self):
         send_chat_action(self.chat_id, "typing")
@@ -56,11 +57,12 @@ class _TelegramProgress:
     def on_event(self, event: dict):
         send_chat_action(self.chat_id, "typing")
         line = self._format_event(event)
-        if line:
+        if line and line != self.last_line:
             self.lines.append(line)
+            self.last_line = line
         now = time.time()
         if self.message_id and (now - self.last_edit_at >= 0.8 or line):
-            text = "\n".join(self.lines[-8:])
+            text = "\n".join(self.lines[-10:])
             result = edit_html_message_text(self.chat_id, self.message_id, text[:3500])
             if not result.get("ok"):
                 _state["last_send_error"] = result.get("error", "")
@@ -74,6 +76,26 @@ class _TelegramProgress:
 
     def _format_event(self, event: dict) -> str:
         event_type = event.get("type")
+        if event_type == "phase":
+            return str(event.get("message") or "").strip()
+        if event_type == "intent":
+            intent = event.get("intent") or "chat"
+            labels = {
+                "recommend": "推荐/选股",
+                "analyze": "单股分析",
+                "market_data": "市场数据查询",
+                "policy": "政策偏好",
+                "ma_check": "均线判断",
+                "followup": "上下文追问",
+                "identity": "身份介绍",
+                "chat": "普通对话",
+            }
+            return f"识别意图: {labels.get(intent, intent)}"
+        if event_type == "memory_context":
+            short_count = int(event.get("short_count") or 0)
+            memory_count = int(event.get("memory_count") or 0)
+            has_summary = "有" if event.get("has_session_summary") else "无"
+            return f"加载记忆: 短期{short_count}条 / 长期{memory_count}条 / 会话摘要{has_summary}"
         if event_type == "rule_start":
             return "已识别为规则选股请求，准备调用选股工具。"
         if event_type == "strategy_parse":
@@ -82,15 +104,30 @@ class _TelegramProgress:
             return f"解析策略: {strategy} {explanation}".strip()
         if event_type == "tool_start":
             tool = event.get("tool") or "unknown_tool"
-            return f"调用工具: {tool}"
+            args = self._format_args(event.get("args") or {})
+            return f"正在调用工具: {tool}{args}"
         if event_type == "tool":
             tool = event.get("tool") or "unknown_tool"
             suffix = "失败" if event.get("error") else "完成"
             return f"工具{suffix}: {tool}"
         if event_type == "llm_turn":
             turn = event.get("turn") or ""
-            return f"推荐助手思考中: 第 {turn} 轮"
+            stage_tools = event.get("stage_tools") or []
+            return f"生成计划: 第 {turn} 轮，可用工具{len(stage_tools)}个"
+        if event_type == "llm_decision":
+            tools = [x for x in (event.get("tools") or []) if x]
+            if tools:
+                return "决策: 需要调用 " + "、".join(tools[:4])
+            return "决策: 已有证据足够，准备组织回复"
+        if event_type == "finalizing":
+            return "正在整合证据，生成最终回复"
         return ""
+
+    def _format_args(self, args: dict) -> str:
+        if not args:
+            return ""
+        keys = [str(k) for k in list(args.keys())[:3]]
+        return " (" + ", ".join(keys) + ")"
 
 
 def get_polling_status() -> dict:
