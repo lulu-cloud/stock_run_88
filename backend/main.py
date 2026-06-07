@@ -53,6 +53,14 @@ _macro_report_state = {
     "last_error": "",
     "interval_minutes": int(os.environ.get("MACRO_REPORT_INTERVAL_MINUTES", "10")),
 }
+_telegram_intraday_state = {
+    "running": False,
+    "last_check": "",
+    "last_push_bucket": "",
+    "last_result": None,
+    "last_error": "",
+    "interval_minutes": int(os.environ.get("TELEGRAM_INTRADAY_INTERVAL_MINUTES", "30")),
+}
 
 
 def _scheduler_loop():
@@ -181,6 +189,46 @@ def _macro_report_loop():
         time.sleep(_macro_report_state["interval_minutes"] * 60)
 
 
+def _is_trade_time(now: datetime) -> bool:
+    if now.weekday() >= 5:
+        return False
+    hm = now.strftime("%H:%M")
+    return ("09:30" <= hm <= "11:30") or ("13:00" <= hm <= "15:05")
+
+
+def _telegram_intraday_loop():
+    """Telegram 盘中提醒：关注股异动、板块摘要和待触发条件单。"""
+    _telegram_intraday_state["running"] = True
+    print(f"[TelegramIntraday] 启动，每 {_telegram_intraday_state['interval_minutes']} 分钟检查一次")
+    while _telegram_intraday_state["running"]:
+        try:
+            now = datetime.now(ZoneInfo("Asia/Shanghai"))
+            _telegram_intraday_state["last_check"] = now.strftime("%Y-%m-%d %H:%M:%S")
+            if _is_trade_time(now):
+                bucket = now.strftime("%Y%m%d-%H") + f"-{now.minute // max(1, _telegram_intraday_state['interval_minutes'])}"
+                if bucket != _telegram_intraday_state.get("last_push_bucket"):
+                    from backend.telegram.gateway import send_rich_message
+                    from backend.telegram.recommender import build_intraday_push_message, list_intraday_push_chats
+
+                    chats = list_intraday_push_chats()
+                    sent = 0
+                    errors = []
+                    for chat_id in chats:
+                        result = send_rich_message(chat_id, build_intraday_push_message(chat_id), "盘中提醒")
+                        if result.get("ok"):
+                            sent += 1
+                        else:
+                            errors.append({"chat_id": chat_id, "error": result.get("error", "")})
+                    _telegram_intraday_state["last_push_bucket"] = bucket
+                    _telegram_intraday_state["last_result"] = {"bucket": bucket, "chats": len(chats), "sent": sent, "errors": errors}
+                    _telegram_intraday_state["last_error"] = ""
+        except Exception as e:
+            print(f"[TelegramIntraday] 错误: {e}")
+            _telegram_intraday_state["last_error"] = str(e)
+            _telegram_intraday_state["last_result"] = {"error": str(e)}
+        time.sleep(_telegram_intraday_state["interval_minutes"] * 60)
+
+
 @app.on_event("startup")
 async def startup_init_db():
     """Ensure idempotent SQLite migrations are applied before APIs run."""
@@ -203,6 +251,12 @@ async def startup_init_db():
     if os.environ.get("MACRO_REPORT_ENABLED", "1") == "1" and not _macro_report_state["running"]:
         t = threading.Thread(target=_macro_report_loop, daemon=True, name="macro-report")
         t.start()
+
+    if os.environ.get("TELEGRAM_INTRADAY_ENABLED", "1") == "1" and not _telegram_intraday_state["running"]:
+        from backend.config import TELEGRAM_BOT_TOKEN
+        if TELEGRAM_BOT_TOKEN:
+            t = threading.Thread(target=_telegram_intraday_loop, daemon=True, name="telegram-intraday")
+            t.start()
 
     if os.environ.get("TELEGRAM_POLLING_ENABLED", "1") == "1":
         from backend.config import TELEGRAM_BOT_TOKEN
@@ -247,6 +301,7 @@ async def automation_status():
         "policy": _policy_state,
         "stock_universe": _stock_universe_state,
         "macro_report": _macro_report_state,
+        "telegram_intraday": _telegram_intraday_state,
         "market_data": get_data_fetch_state(),
     }
 

@@ -3,7 +3,7 @@
 import json
 import re
 import time
-from datetime import date
+from datetime import date, timedelta
 
 from langchain.tools import tool
 from langchain_openai import ChatOpenAI
@@ -78,6 +78,12 @@ def _guess_intent(text: str) -> str:
         return "memory"
     if any(token in raw for token in ("你是谁", "你叫什么", "你的名字")):
         return "identity"
+    if any(token in raw for token in ("上次推荐", "刚才推荐", "刚刚推荐", "上次那只", "刚才那只", "那几个怎么样")):
+        return "followup"
+    if lower.startswith(("/backtest", "/bt")) or "回测" in raw:
+        return "backtest"
+    if lower.startswith(("/intraday", "/alert")) or any(token in raw for token in ("盘中提醒", "盘中检查", "盘中异动")):
+        return "intraday"
     if lower.startswith(("/analyze", "analyze", "分析", "看看", "问问")) or any(
         token in raw for token in ("如何看", "怎么看", "点评", "评价", "分析下")
     ):
@@ -233,6 +239,148 @@ def format_simulation_performance(sim_id: int) -> str:
     return "\n".join(lines)
 
 
+def _backtest_dates(period: str) -> tuple[str, str]:
+    from backend.data.loader import load_index_daily
+    idx = load_index_daily()
+    today = date.today()
+    latest = today.strftime("%Y%m%d")
+    if idx is not None and not idx.empty:
+        latest = str(idx.iloc[-1]["trade_date"])
+        today = date(int(latest[:4]), int(latest[4:6]), int(latest[6:8]))
+    p = (period or "1m").lower()
+    if p in ("3d", "三天"):
+        start_dt = today - timedelta(days=5)
+    elif p in ("1w", "一周", "一星期"):
+        start_dt = today - timedelta(days=10)
+    elif p in ("1q", "3m", "一季度", "季度"):
+        start_dt = today - timedelta(days=95)
+    elif p in ("ytd", "今年", "今年以来"):
+        start_dt = date(today.year, 1, 1)
+    else:
+        start_dt = today - timedelta(days=35)
+    return start_dt.strftime("%Y%m%d"), latest
+
+
+def _format_backtest_reply(raw: str) -> str:
+    from backend.backtest.engine import run_backtest
+    from backend.strategies.registry import StrategyRegistry
+
+    lowered = (raw or "").lower()
+    period = "1m"
+    for token in ("3d", "1w", "1m", "1q", "3m", "ytd"):
+        if token in lowered:
+            period = token
+            break
+    if "三天" in raw:
+        period = "3d"
+    elif "一周" in raw or "一星期" in raw:
+        period = "1w"
+    elif "季度" in raw:
+        period = "1q"
+    elif "今年" in raw:
+        period = "ytd"
+
+    strategy_name = ""
+    for name in sorted(StrategyRegistry.list_all(), key=len, reverse=True):
+        if name.lower() in lowered:
+            strategy_name = name
+            break
+    if not strategy_name:
+        parsed = parse_strategy_request(raw)
+        strategy_name = parsed.get("strategy") or "ma_bullish_pullback"
+    start, end = _backtest_dates(period)
+    result = run_backtest(strategy_name, {}, start, end)
+    if result.get("error"):
+        return f"回测失败: {result['error']}\n用法: /backtest ma_bullish_pullback 1m"
+    metrics = result.get("metrics") or {}
+    trades = result.get("trades") or []
+    max_drawdown = abs(float(metrics.get("max_drawdown") or 0))
+    lines = [
+        f"回测结果: {strategy_name}",
+        f"区间: {start} - {end} ({period})",
+        f"- 总收益: {_fmt_pct(metrics.get('total_return'))}",
+        f"- 最大回撤: {max_drawdown:.2f}%",
+        f"- 胜率: {_fmt_pct(metrics.get('win_rate'))}",
+        f"- 交易次数: {metrics.get('total_trades', len(trades))}",
+        f"- 最终资产: {_fmt_money(metrics.get('final_assets'))}",
+    ]
+    if trades:
+        lines.append("最近成交:")
+        for item in trades[-5:]:
+            lines.append(
+                f"- {item.get('date') or item.get('trade_date','')} "
+                f"{item.get('action') or item.get('direction','')} {item.get('ts_code','')} "
+                f"@{float(item.get('price') or 0):.2f}"
+            )
+    lines.append("仅供研究，不构成投资建议。")
+    return "\n".join(lines)
+
+
+def _format_intraday_reply(chat_id: str, raw: str = "") -> str:
+    from backend.telegram.profile import list_watch
+    from backend.telegram.stock_analysis import watchlist_alerts
+
+    lines = ["盘中检查"]
+    watch = list_watch(chat_id or "local")
+    lines.append(watchlist_alerts(chat_id or "local", watch))
+    try:
+        lines.append("")
+        lines.append("板块热度:")
+        lines.append(format_macro_topic("sector")[:1800])
+    except Exception as exc:
+        lines.append(f"板块热度读取失败: {exc}")
+    conn = get_conn()
+    pending = conn.execute(
+        """SELECT a.display_name, o.ts_code, o.stock_name, o.direction, o.order_type, o.price, o.trigger_price, o.status
+           FROM agent_order o
+           JOIN agent_info a ON a.id=o.agent_id
+           WHERE o.status IN ('pending','triggered')
+           ORDER BY o.trade_date DESC, o.id DESC
+           LIMIT 8"""
+    ).fetchall()
+    conn.close()
+    lines.append("")
+    lines.append("待触发条件/预操作单:")
+    if not pending:
+        lines.append("- 暂无")
+    for row in pending:
+        r = dict(row)
+        direction = "买入" if r.get("direction") == "buy" else "卖出"
+        trigger = f" 触发{float(r.get('trigger_price') or 0):.2f}" if r.get("trigger_price") else ""
+        lines.append(
+            f"- {r.get('display_name')} {direction} {r.get('ts_code')} {r.get('stock_name') or ''} "
+            f"{r.get('order_type')} @{float(r.get('price') or 0):.2f}{trigger}"
+        )
+    lines.append("仅供研究，不构成投资建议。")
+    return "\n".join(lines)
+
+
+def set_intraday_push(chat_id: str, enabled: bool) -> None:
+    conn = get_conn()
+    conn.execute(
+        """INSERT INTO system_settings (key, value, updated_at)
+           VALUES (?, ?, datetime('now'))
+           ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')""",
+        (f"telegram_intraday_enabled:{chat_id or 'local'}", "1" if enabled else "0"),
+    )
+    conn.commit()
+    conn.close()
+
+
+def list_intraday_push_chats() -> list[str]:
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT key FROM system_settings
+           WHERE key LIKE 'telegram_intraday_enabled:%' AND value IN ('1','true','on','yes')"""
+    ).fetchall()
+    conn.close()
+    return [str(r["key"]).split(":", 1)[1] for r in rows if str(r["key"]).split(":", 1)[1]]
+
+
+def build_intraday_push_message(chat_id: str) -> str:
+    return _format_intraday_reply(chat_id or "local", "/intraday")
+
+
 def _profile_prompt_suffix(profile: dict | None) -> str:
     if not profile:
         return ""
@@ -317,6 +465,76 @@ def _record_recommendation(chat_id: str, username: str, query: str, rows: list[d
         if item.get("ts_code"):
             _record_interest_quietly(chat_id, username, item.get("ts_code", ""), query, f"recommend:{strategy}")
     return ids
+
+
+def _recent_recommended_stocks(chat_id: str, limit: int = 5) -> list[dict]:
+    if not chat_id:
+        return []
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT id, query, ts_code, stock_name, recommend_price, recommendation_json, created_at
+           FROM telegram_recommend_feedback
+           WHERE chat_id=? AND feedback_type='recommended'
+           ORDER BY created_at DESC, id DESC
+           LIMIT ?""",
+        (chat_id, max(1, min(int(limit or 5), 20))),
+    ).fetchall()
+    conn.close()
+    results = []
+    seen = set()
+    for row in rows:
+        item = dict(row)
+        code = item.get("ts_code") or ""
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        try:
+            rec = json.loads(item.get("recommendation_json") or "{}")
+        except Exception:
+            rec = {}
+        results.append({
+            "id": item.get("id"),
+            "query": item.get("query") or "",
+            "ts_code": code,
+            "name": item.get("stock_name") or rec.get("name") or lookup_stock_name(code),
+            "recommend_price": item.get("recommend_price"),
+            "reason": rec.get("reason") or "",
+            "created_at": item.get("created_at") or "",
+        })
+    return results
+
+
+def _is_recommend_followup(raw: str) -> bool:
+    text = raw or ""
+    return any(token in text for token in (
+        "上次推荐", "刚才推荐", "刚刚推荐", "前面推荐", "上回推荐",
+        "上次那只", "刚才那只", "刚刚那只", "那只怎么样", "那几个怎么样",
+        "继续看", "继续分析", "还有机会吗", "还能买吗", "现在怎么样",
+    ))
+
+
+def _format_recommend_followup(raw: str, chat_id: str, username: str, profile: dict | None = None,
+                               user_id: str = "", thread_id: str = "default") -> str:
+    explicit = extract_stock_mentions(raw)
+    recent = _recent_recommended_stocks(chat_id or "local", 5)
+    targets = explicit or [item["ts_code"] for item in recent[:3]]
+    if not targets:
+        memory_context = build_memory_prompt(chat_id or "local", user_id, thread_id, raw, None, 8)
+        prompt = memory_context.get("prompt") or ""
+        hinted = extract_stock_mentions(prompt)
+        targets = hinted[:3]
+    if not targets:
+        return "我没找到最近一次推荐的标的。可以直接发股票名或代码，例如：京东方A现在怎么样。"
+    lines = ["基于最近推荐/当前追问做延续分析"]
+    if recent:
+        last = recent[0]
+        lines.append(f"最近推荐记录: {last['ts_code']} {last.get('name','')}，来自“{last.get('query','')[:40]}”。")
+    for code in targets[:3]:
+        lines.append("")
+        lines.append(generate_stock_report(code, profile))
+        _record_interest_quietly(chat_id or "local", username, code, raw, "recommend_followup", profile, user_id, thread_id)
+    lines.append("仅供研究，不构成投资建议。")
+    return "\n\n---\n\n".join(lines)
 
 
 def _ma_bullish_snapshot(ts_code: str) -> dict:
@@ -811,8 +1029,9 @@ RECOMMEND_TOOLS = [
 RECOMMEND_SYSTEM_PROMPT = """你是股票推荐助手，使用 ReAct 工具循环回答 Telegram 用户。
 
 要求：
-- 先识别 intent：recommend/analyze/compare/ma_check/price_volume/policy/profile/watchlist/identity/feedback/help。
+- 先识别 intent：recommend/analyze/compare/ma_check/price_volume/policy/profile/watchlist/identity/followup/backtest/intraday/feedback/help。
 - 输入 JSON 里 memory_context 已按层分开：short_term_messages 是最近 5-8 轮短期上下文，session_summary 是当前会话中期摘要，long_term_memories 是 user/chat/thread/global 长期画像。回答时优先遵守当前用户记忆，不要把群聊其他人的偏好当成当前用户偏好。
+- 用户说“上次推荐的那只/刚才那几个/继续看”时，优先结合 memory_context 中最近推荐标的和上下文回答，不能当成全新无上下文问题。
 - 推荐股票时必须调用 recommend_get_user_profile(chat_id,user_id) 和 recommend_get_trader_memory；通常还要调用 recommend_search_stocks。
 - 对最终推荐中的主要标的至少抽样调用 recommend_analyze_stock 或 recommend_compare_stocks 获取证据。
 - 用户问“是否多头均线发散”时调用 recommend_check_ma_bullish；问“最近十天价格与量趋势”时调用 recommend_price_volume_trend。
@@ -1214,6 +1433,8 @@ def _handle_text_message_inner(
             "/profile 或 /profile set 风险=中等 周期=短线 板块=AI,半导体\n"
             "/watch add 600000.SH / /watch list / /watch remove 600000.SH\n"
             "/daily on / /daily off\n"
+            "/intraday 盘中检查关注股、板块和待触发条件单\n"
+            "/backtest ma_bullish_pullback 1m\n"
             "/memory 查看记忆 / /memory forget 关键词\n"
             "/login 获取看板登录验证码 / /whoami 查看 Telegram 身份\n"
             "/status 1\n"
@@ -1259,6 +1480,18 @@ def _handle_text_message_inner(
         if not sim_id:
             return "用法: /sim 1"
         return format_simulation_performance(sim_id)
+
+    if lower.startswith(("/backtest", "/bt", "backtest", "bt")) or "回测" in raw:
+        return _format_backtest_reply(raw)
+
+    if lower.startswith(("/intraday", "/alert", "intraday")) or any(token in raw for token in ("盘中提醒", "盘中检查", "盘中异动")):
+        if "off" in lower or "关闭" in raw:
+            set_intraday_push(chat_id or "local", False)
+            return "盘中提醒已关闭。"
+        if "on" in lower or "开启" in raw:
+            set_intraday_push(chat_id or "local", True)
+            return "盘中提醒已开启。交易时段会按配置间隔推送关注股、板块和待触发条件单。"
+        return _format_intraday_reply(chat_id or "local", raw)
 
     if any(token in raw for token in ("国家政策偏好", "政策偏好", "最近政策", "政策方向", "国家政策")):
         return _format_policy_preference()
@@ -1312,6 +1545,9 @@ def _handle_text_message_inner(
 
     if stock_codes and any(token in raw for token in ("量价", "价格与量", "价格和量", "成交量趋势", "十天", "10天", "近10日", "最近10日")):
         return _format_price_volume_trend(stock_codes[0], 10, chat_id or "local", username, raw, profile)
+
+    if _is_recommend_followup(raw):
+        return _format_recommend_followup(raw, chat_id or "local", username, profile, user_id, thread_id)
 
     single_stock_intent = (
         lower.startswith(("/analyze", "analyze", "分析", "看看", "问问"))

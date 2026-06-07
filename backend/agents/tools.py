@@ -30,6 +30,13 @@ from backend.evolution.engine import prepare_evolution_context, format_evolution
 from backend.evolution.skills import get_skill as _get_skill, strategy_param_schema
 
 
+def _latest_trade_date() -> str:
+    df = load_index_daily()
+    if df is not None and not df.empty:
+        return str(df.iloc[-1]["trade_date"])
+    return ""
+
+
 def _format_kline_brief(df, lookback: int = 5) -> str:
     """格式化K线数据摘要"""
     recent = df.tail(lookback)
@@ -93,6 +100,112 @@ def search_stocks_by_strategy(strategy_name: str, params_json: str = "{}") -> st
 
     results.sort(key=lambda r: r["score"], reverse=True)
     return json.dumps(results[:20], ensure_ascii=False)
+
+
+def _parse_strategy_combo(strategy_weights_json: str, params_json: str = "{}") -> tuple[list[tuple[str, float]], dict]:
+    try:
+        raw = json.loads(strategy_weights_json or "{}")
+    except Exception:
+        raw = {}
+    combo: list[tuple[str, float]] = []
+    if isinstance(raw, dict):
+        for name, weight in raw.items():
+            combo.append((str(name), float(weight or 0)))
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                name = item.get("strategy") or item.get("name")
+                if name:
+                    combo.append((str(name), float(item.get("weight") or 0)))
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                combo.append((str(item[0]), float(item[1] or 0)))
+    combo = [(name, weight) for name, weight in combo if name and weight > 0]
+    total = sum(weight for _, weight in combo) or 1.0
+    combo = [(name, weight / total) for name, weight in combo]
+    try:
+        params = json.loads(params_json or "{}")
+        if not isinstance(params, dict):
+            params = {}
+    except Exception:
+        params = {}
+    return combo, params
+
+
+def _strategy_params_for(params: dict, strategy_name: str) -> dict:
+    value = params.get(strategy_name, {})
+    if isinstance(value, dict):
+        return value
+    if any(k in params for k in ("lookback_days", "min_limit_up_days", "pullback_within_pct")):
+        return params
+    return {}
+
+
+def _run_strategy_combo(rows: list[dict], combo: list[tuple[str, float]], params: dict, max_results: int = 20) -> list[dict]:
+    strategies = []
+    for name, weight in combo:
+        strategy = StrategyRegistry.create(name, **_strategy_params_for(params, name))
+        if strategy is not None:
+            strategies.append((name, weight, strategy))
+    if not strategies:
+        return []
+    results = []
+    for row in rows:
+        ts_code = normalize_ts_code(row.get("ts_code", ""))
+        name = row.get("name") or row.get("stock_name") or ts_code
+        df = load_daily(ts_code)
+        if df is None or len(df) < 30:
+            continue
+        df = compute_limit_status(compute_mas(df))
+        score = 0.0
+        hits = []
+        for strategy_name, weight, strategy in strategies:
+            try:
+                result = strategy.filter(ts_code, name, df)
+            except Exception:
+                result = None
+            if not result:
+                continue
+            score += float(result.score or 0) * weight
+            hits.append({
+                "strategy": strategy_name,
+                "weight": round(weight, 4),
+                "score": result.score,
+                "reason": result.reason,
+                "extra": result.extra,
+            })
+        if hits:
+            results.append({
+                "ts_code": ts_code,
+                "name": name,
+                "combo_score": round(score, 2),
+                "score": round(score, 2),
+                "matched_strategy_count": len(hits),
+                "matched_strategies": hits,
+                "reason": "；".join(f"{h['strategy']}({float(h['score'] or 0):.1f})" for h in hits[:4]),
+                "pool_note": row.get("note") or "",
+            })
+    results.sort(key=lambda r: (r["combo_score"], r["matched_strategy_count"]), reverse=True)
+    return results[:max(1, min(int(max_results or 20), 50))]
+
+
+@tool
+def search_stocks_by_strategy_combo(strategy_weights_json: str, params_json: str = "{}", max_results: int = 20) -> str:
+    """组合多个策略做加权选股。
+
+    Args:
+        strategy_weights_json: JSON 对象或数组，如 '{"momentum":0.4,"ma_bullish_pullback":0.6}'
+        params_json: 各策略参数 JSON，如 '{"ma_bullish_pullback":{"pullback_within_pct":2.5}}'
+        max_results: 返回数量
+
+    Returns:
+        JSON，包含组合得分、命中的策略和每个策略的理由。
+    """
+    combo, params = _parse_strategy_combo(strategy_weights_json, params_json)
+    if not combo:
+        return json.dumps({"error": "strategy_weights_json 为空或格式不正确"}, ensure_ascii=False)
+    main_board = list_main_board_stocks()
+    rows = [dict(r) for _, r in main_board.iterrows()]
+    return json.dumps(_run_strategy_combo(rows, combo, params, max_results), ensure_ascii=False, default=str)
 
 
 def _stock_pool_rows(agent_id: int) -> list[dict]:
@@ -167,6 +280,24 @@ def search_stocks_in_agent_pool(agent_id: int, strategy_name: str, params_json: 
 
 
 @tool
+def search_stocks_in_agent_pool_combo(agent_id: int, strategy_weights_json: str, params_json: str = "{}", max_results: int = 20) -> str:
+    """只在当前 Agent 的前端股票池内做多策略加权选股。"""
+    combo, params = _parse_strategy_combo(strategy_weights_json, params_json)
+    if not combo:
+        return json.dumps({"error": "strategy_weights_json 为空或格式不正确"}, ensure_ascii=False)
+    rows = _stock_pool_rows(agent_id)
+    normalized_rows = [
+        {
+            "ts_code": normalize_ts_code(item.get("ts_code", "")),
+            "name": item.get("stock_name") or item.get("ts_code", ""),
+            "note": item.get("note") or "",
+        }
+        for item in rows
+    ]
+    return json.dumps(_run_strategy_combo(normalized_rows, combo, params, max_results), ensure_ascii=False, default=str)
+
+
+@tool
 def get_stock_kline(ts_code: str, days: int = 30) -> str:
     """获取个股日线K线数据。
 
@@ -185,6 +316,102 @@ def get_stock_kline(ts_code: str, days: int = 30) -> str:
     df = compute_mas(df)
     df = compute_limit_status(df)
     return _format_kline_brief(df, days)
+
+
+def _period_trend(data: pd.DataFrame, label: str, ma_window: int = 5) -> dict:
+    if data is None or len(data) < 2:
+        return {"period": label, "ok": False}
+    frame = data.copy().reset_index(drop=True)
+    frame["ma"] = pd.to_numeric(frame["close"], errors="coerce").rolling(window=max(2, ma_window), min_periods=1).mean()
+    latest = frame.iloc[-1]
+    prev = frame.iloc[-min(len(frame), max(2, ma_window))]
+    close = float(latest.get("close") or 0)
+    prev_close = float(prev.get("close") or close or 1)
+    ma = float(latest.get("ma") or 0)
+    prev_ma = float(prev.get("ma") or ma)
+    pct = (close - prev_close) / (prev_close or 1) * 100
+    return {
+        "period": label,
+        "ok": True,
+        "close": round(close, 2),
+        "pct": round(pct, 2),
+        "ma": round(ma, 2),
+        "ma_slope": "up" if ma > prev_ma else ("down" if ma < prev_ma else "flat"),
+        "trend": "up" if close >= ma and ma >= prev_ma else ("down" if close < ma and ma < prev_ma else "mixed"),
+    }
+
+
+@tool
+def get_multi_period_trend(ts_code: str, include_intraday: bool = True) -> str:
+    """分析个股日线、周线、月线和可选 60 分钟趋势背景。
+
+    Args:
+        ts_code: 股票代码
+        include_intraday: 是否按需拉取最近交易日 5分钟K线并合成60分钟趋势
+
+    Returns:
+        JSON，多周期趋势状态，用于右侧交易和精确入场确认。
+    """
+    code = normalize_ts_code(ts_code)
+    df = load_daily(code)
+    if df is None or len(df) < 30:
+        return json.dumps({"ok": False, "ts_code": code, "error": "日线数据不足"}, ensure_ascii=False)
+    data = compute_mas(df).sort_values("trade_date").reset_index(drop=True)
+    latest_date = str(data.iloc[-1]["trade_date"])
+    weekly_src = data.tail(120).reset_index(drop=True)
+    monthly_src = data.tail(260).reset_index(drop=True)
+    weekly = weekly_src.groupby((pd.RangeIndex(len(weekly_src)) // 5)).agg({
+        "trade_date": "last",
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "vol": "sum",
+        "amount": "sum",
+    }).reset_index(drop=True)
+    monthly = monthly_src.groupby((pd.RangeIndex(len(monthly_src)) // 20)).agg({
+        "trade_date": "last",
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "vol": "sum",
+        "amount": "sum",
+    }).reset_index(drop=True)
+    result = {
+        "ok": True,
+        "ts_code": code,
+        "trade_date": latest_date,
+        "daily": _period_trend(data.tail(30), "daily", 5),
+        "weekly": _period_trend(weekly.tail(12), "weekly", 4),
+        "monthly": _period_trend(monthly.tail(12), "monthly", 3),
+        "intraday_60m": {"ok": False, "source": "disabled"},
+    }
+    if include_intraday:
+        try:
+            from backend.evolution.minute_replay import load_or_fetch_5m
+            minute_df, source = load_or_fetch_5m(code, latest_date)
+            if minute_df is not None and not minute_df.empty:
+                m = minute_df.copy()
+                if "close" in m.columns:
+                    m = m.reset_index(drop=True)
+                    agg = {
+                        "open": "first",
+                        "high": "max",
+                        "low": "min",
+                        "close": "last",
+                    }
+                    if "vol" in m.columns:
+                        agg["vol"] = "sum"
+                    grouped = m.groupby((pd.RangeIndex(len(m)) // 12)).agg(agg).reset_index(drop=True)
+                    result["intraday_60m"] = {**_period_trend(grouped.tail(8), "60m", 3), "source": source}
+        except Exception as exc:
+            result["intraday_60m"] = {"ok": False, "error": str(exc)}
+    result["summary"] = (
+        f"日线{result['daily'].get('trend')}，周线{result['weekly'].get('trend')}，"
+        f"月线{result['monthly'].get('trend')}，60m{result['intraday_60m'].get('trend', 'unknown')}"
+    )
+    return json.dumps(result, ensure_ascii=False, default=str)
 
 
 @tool
@@ -284,6 +511,317 @@ def get_market_breadth(trade_date: str = "") -> str:
 def get_sector_temperature(trade_date: str = "", top_n: int = 20) -> str:
     """统计当日板块温度，返回热门板块、风险板块、领涨股和市场状态。"""
     return json.dumps(compute_sector_temperature(trade_date, top_n), ensure_ascii=False, default=str)
+
+
+@tool
+def suggest_adaptive_strategy_params(strategy_name: str, trade_date: str = "") -> str:
+    """根据市场宽度、指数波动率和 risk-on 分数建议策略参数。
+
+    Args:
+        strategy_name: 策略名称，如 momentum/ma_bullish_pullback/trend
+        trade_date: 交易日期，空字符串表示最新
+
+    Returns:
+        JSON，包含市场状态、建议参数和原因。Agent 仍需自行判断是否采用。
+    """
+    effective_date = trade_date or _latest_trade_date()
+    breadth = compute_market_breadth(effective_date)
+    risk_on = float(breadth.get("risk_on_score") or breadth.get("risk_score") or 0)
+    index_df = load_index_daily()
+    volatility = 0.0
+    if index_df is not None and len(index_df) >= 20:
+        recent = pd.to_numeric(index_df.tail(20)["pct_chg"], errors="coerce").fillna(0)
+        volatility = float(recent.std(ddof=0))
+    regime = "risk_on" if risk_on >= 60 else ("risk_off" if risk_on <= 40 else "neutral")
+    name = (strategy_name or "").strip()
+    params: dict = {}
+    reasons = [f"市场状态 {regime}", f"risk_on_score={risk_on:.1f}", f"指数20日波动={volatility:.2f}%"]
+    if name == "momentum":
+        if regime == "risk_on":
+            params = {"min_limit_up_days": 1, "lookback_days": 12, "healthy_turnover_max": 30.0}
+            reasons.append("risk-on 可接受首板/二板和稍高换手")
+        elif regime == "risk_off":
+            params = {"min_limit_up_days": 2, "lookback_days": 8, "healthy_turnover_max": 18.0}
+            reasons.append("risk-off 只看更近、更强且换手不过热的连板")
+        else:
+            params = {"min_limit_up_days": 2, "lookback_days": 12, "healthy_turnover_max": 25.0}
+    elif name == "ma_bullish_pullback":
+        if regime == "risk_on":
+            params = {"pullback_within_pct": 3.5, "max_deviation_pct": 20.0, "slope_lookback": 4}
+            reasons.append("risk-on 放宽回踩偏离，追求趋势延续")
+        elif regime == "risk_off":
+            params = {"pullback_within_pct": 2.0, "max_deviation_pct": 12.0, "slope_lookback": 6}
+            reasons.append("risk-off 只接受贴近均线、偏离较低的回踩")
+        else:
+            params = {"pullback_within_pct": 3.0, "max_deviation_pct": 16.0, "slope_lookback": 5}
+    elif name in ("trend", "uptrend", "ma_bullish"):
+        params = {
+            "lookback_days": 40 if regime == "risk_on" else 60,
+            "min_score": 55 if regime == "risk_on" else 65,
+        }
+        reasons.append("趋势策略按市场强弱调整回看周期和最低分")
+    else:
+        params = {"note": "该策略暂无专用自适应模板，可先调用 get_strategy_param_schema 查看可调参数"}
+    return json.dumps({
+        "strategy_name": name,
+        "trade_date": effective_date,
+        "market_regime": regime,
+        "risk_on_score": round(risk_on, 2),
+        "index_volatility_20d_pct": round(volatility, 4),
+        "suggested_params": params,
+        "reasons": reasons,
+        "schema": strategy_param_schema(name),
+    }, ensure_ascii=False, default=str)
+
+
+def _json_loads_safe(text: str | None) -> dict:
+    try:
+        data = json.loads(text or "{}")
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+@tool
+def detect_strategy_crowding(trade_date: str = "", lookback_days: int = 3) -> str:
+    """检测多个 Agent 是否在同一批股票、技能或板块上过度拥挤。
+
+    Args:
+        trade_date: 截止交易日，空字符串表示最新
+        lookback_days: 近 N 个交易日订单窗口
+
+    Returns:
+        JSON，包含拥挤标的、拥挤技能、拥挤板块和风险提示。
+    """
+    effective_date = trade_date or _latest_trade_date()
+    conn = get_read_conn()
+    rows = conn.execute(
+        """SELECT o.agent_id, a.display_name, o.ts_code, o.stock_name, o.direction, o.status,
+                  o.skill_id, o.trade_date,
+                  COALESCE(sb.sector_tag, sb.sector, sb.industry_tag, sb.industry, '未知') AS sector
+           FROM agent_order o
+           JOIN agent_info a ON a.id=o.agent_id
+           LEFT JOIN stock_basic sb ON sb.ts_code=o.ts_code
+           WHERE o.trade_date <= ?
+           ORDER BY o.trade_date DESC, o.id DESC
+           LIMIT ?""",
+        (effective_date, max(50, int(lookback_days or 3) * 80)),
+    ).fetchall()
+    conn.close()
+    stock_map: dict[str, dict] = {}
+    skill_map: dict[str, dict] = {}
+    sector_map: dict[str, dict] = {}
+    for row in rows:
+        r = dict(row)
+        code = r.get("ts_code") or ""
+        agent = r.get("display_name") or str(r.get("agent_id"))
+        stock = stock_map.setdefault(code, {
+            "ts_code": code,
+            "stock_name": r.get("stock_name") or "",
+            "agents": set(),
+            "directions": {},
+            "orders": 0,
+        })
+        stock["agents"].add(agent)
+        stock["orders"] += 1
+        direction = r.get("direction") or ""
+        stock["directions"][direction] = stock["directions"].get(direction, 0) + 1
+        skill = r.get("skill_id") or "unknown"
+        skill_stat = skill_map.setdefault(skill, {"skill_id": skill, "agents": set(), "orders": 0})
+        skill_stat["agents"].add(agent)
+        skill_stat["orders"] += 1
+        sector = r.get("sector") or "未知"
+        sector_stat = sector_map.setdefault(sector, {"sector": sector, "agents": set(), "orders": 0})
+        sector_stat["agents"].add(agent)
+        sector_stat["orders"] += 1
+    crowded_stocks = []
+    for item in stock_map.values():
+        agents = sorted(item.pop("agents"))
+        if len(agents) >= 2 or item["orders"] >= 3:
+            item["agents"] = agents
+            item["agent_count"] = len(agents)
+            crowded_stocks.append(item)
+    for stat in list(skill_map.values()) + list(sector_map.values()):
+        agents = sorted(stat.pop("agents"))
+        stat["agents"] = agents
+        stat["agent_count"] = len(agents)
+    crowded_skills = [x for x in skill_map.values() if x["agent_count"] >= 2 or x["orders"] >= 3]
+    crowded_sectors = [x for x in sector_map.values() if x["agent_count"] >= 2 or x["orders"] >= 3]
+    crowded_stocks.sort(key=lambda x: (x["agent_count"], x["orders"]), reverse=True)
+    crowded_skills.sort(key=lambda x: (x["agent_count"], x["orders"]), reverse=True)
+    crowded_sectors.sort(key=lambda x: (x["agent_count"], x["orders"]), reverse=True)
+    warnings = []
+    if crowded_stocks:
+        warnings.append("多个 Agent 近期集中交易同一标的，回撤相关性可能升高")
+    if crowded_sectors:
+        warnings.append("多个 Agent 暴露在同一板块，需控制总组合集中度")
+    return json.dumps({
+        "trade_date": effective_date,
+        "lookback_days": lookback_days,
+        "crowded_stocks": crowded_stocks[:12],
+        "crowded_skills": crowded_skills[:10],
+        "crowded_sectors": crowded_sectors[:10],
+        "warnings": warnings,
+    }, ensure_ascii=False, default=str)
+
+
+@tool
+def get_agent_signal_committee(trade_date: str = "") -> str:
+    """读取多 Agent 共享研判和订单信号，给出投委会式综合意见。
+
+    Args:
+        trade_date: 交易日期，空字符串表示最新
+
+    Returns:
+        JSON，包含市场状态投票、共识标的、冲突标的和综合建议。
+    """
+    effective_date = trade_date or _latest_trade_date()
+    conn = get_read_conn()
+    contexts = conn.execute(
+        """SELECT c.*, a.display_name
+           FROM agent_shared_context c
+           JOIN agent_info a ON a.id=c.agent_id
+           WHERE c.trade_date=?
+           ORDER BY c.agent_id""",
+        (effective_date,),
+    ).fetchall()
+    orders = conn.execute(
+        """SELECT o.agent_id, a.display_name, o.ts_code, o.stock_name, o.direction, o.quantity,
+                  o.price, o.order_type, o.status, o.reason
+           FROM agent_order o
+           JOIN agent_info a ON a.id=o.agent_id
+           WHERE o.trade_date=? AND o.status IN ('pending','triggered','filled')
+           ORDER BY o.id DESC""",
+        (effective_date,),
+    ).fetchall()
+    conn.close()
+    regime_votes: dict[str, float] = {}
+    context_rows = []
+    for row in contexts:
+        item = dict(row)
+        payload = _json_loads_safe(item.get("payload_json"))
+        regime = item.get("market_regime") or "unknown"
+        confidence = float(item.get("confidence") or 0)
+        regime_votes[regime] = regime_votes.get(regime, 0.0) + max(confidence, 0.1)
+        context_rows.append({
+            "agent_id": item.get("agent_id"),
+            "agent_name": item.get("display_name"),
+            "market_regime": regime,
+            "confidence": round(confidence, 3),
+            "summary": item.get("summary") or "",
+            "selected_stocks": payload.get("selected_stocks") or [],
+        })
+    signal_map: dict[str, dict] = {}
+    for row in orders:
+        r = dict(row)
+        code = r.get("ts_code") or ""
+        signal = signal_map.setdefault(code, {
+            "ts_code": code,
+            "stock_name": r.get("stock_name") or "",
+            "buy_agents": [],
+            "sell_agents": [],
+            "orders": [],
+        })
+        bucket = "buy_agents" if r.get("direction") == "buy" else "sell_agents"
+        signal[bucket].append(r.get("display_name") or str(r.get("agent_id")))
+        signal["orders"].append({
+            "agent": r.get("display_name"),
+            "direction": r.get("direction"),
+            "quantity": r.get("quantity"),
+            "price": r.get("price"),
+            "order_type": r.get("order_type"),
+            "reason": (r.get("reason") or "")[:180],
+        })
+    consensus = []
+    conflicts = []
+    for item in signal_map.values():
+        item["buy_agents"] = sorted(set(item["buy_agents"]))
+        item["sell_agents"] = sorted(set(item["sell_agents"]))
+        if item["buy_agents"] and item["sell_agents"]:
+            conflicts.append(item)
+        elif len(item["buy_agents"]) >= 2 or len(item["sell_agents"]) >= 2:
+            consensus.append(item)
+    consensus.sort(key=lambda x: max(len(x["buy_agents"]), len(x["sell_agents"])), reverse=True)
+    top_regime = max(regime_votes.items(), key=lambda x: x[1], default=("unknown", 0.0))[0]
+    advice = []
+    if conflicts:
+        advice.append("存在跨 Agent 反向信号，入库前应在订单 trace 中保留 warning，并降低冲突标的仓位。")
+    if consensus:
+        advice.append("存在多 Agent 共识标的，可提高研究优先级，但仍需检查板块/相关性拥挤。")
+    if top_regime in ("risk_off", "弱势", "defensive"):
+        advice.append("投委会偏防守，建议降低总仓位和追高强度。")
+    return json.dumps({
+        "trade_date": effective_date,
+        "market_regime_vote": {k: round(v, 3) for k, v in regime_votes.items()},
+        "committee_regime": top_regime,
+        "agent_contexts": context_rows,
+        "consensus_signals": consensus[:10],
+        "conflict_signals": conflicts[:10],
+        "advice": advice,
+    }, ensure_ascii=False, default=str)
+
+
+@tool
+def get_global_position_exposure() -> str:
+    """统计所有交易员的全局仓位、个股暴露和板块暴露。"""
+    conn = get_read_conn()
+    rows = conn.execute(
+        """SELECT p.agent_id, a.display_name, p.ts_code, p.stock_name, p.quantity, p.market_value,
+                  COALESCE(sb.sector_tag, sb.sector, sb.industry_tag, sb.industry, '未知') AS sector
+           FROM agent_position p
+           JOIN agent_info a ON a.id=p.agent_id
+           LEFT JOIN stock_basic sb ON sb.ts_code=p.ts_code
+           WHERE p.quantity > 0""",
+    ).fetchall()
+    cash_rows = conn.execute("SELECT id, display_name, current_cash FROM agent_info ORDER BY id").fetchall()
+    conn.close()
+    total_cash = sum(float(r["current_cash"] or 0) for r in cash_rows)
+    total_mv = sum(float(r["market_value"] or 0) for r in rows)
+    total_assets = total_cash + total_mv
+    stock_exposure: dict[str, dict] = {}
+    sector_exposure: dict[str, dict] = {}
+    agent_exposure: dict[str, dict] = {}
+    for row in rows:
+        r = dict(row)
+        mv = float(r.get("market_value") or 0)
+        agent = r.get("display_name") or str(r.get("agent_id"))
+        code = r.get("ts_code") or ""
+        sector = r.get("sector") or "未知"
+        stock = stock_exposure.setdefault(code, {"ts_code": code, "stock_name": r.get("stock_name") or "", "market_value": 0.0, "agents": set()})
+        stock["market_value"] += mv
+        stock["agents"].add(agent)
+        sec = sector_exposure.setdefault(sector, {"sector": sector, "market_value": 0.0, "stocks": set(), "agents": set()})
+        sec["market_value"] += mv
+        sec["stocks"].add(code)
+        sec["agents"].add(agent)
+        ag = agent_exposure.setdefault(agent, {"agent": agent, "market_value": 0.0, "stock_count": 0})
+        ag["market_value"] += mv
+        ag["stock_count"] += 1
+    def finalize(items: list[dict], set_fields: tuple[str, ...]) -> list[dict]:
+        output = []
+        for item in items:
+            x = dict(item)
+            for field in set_fields:
+                x[field] = sorted(x[field])
+                x[f"{field[:-1]}_count" if field.endswith("s") else f"{field}_count"] = len(x[field])
+            x["weight_pct"] = round(float(x.get("market_value") or 0) / total_assets * 100, 2) if total_assets else 0.0
+            x["market_value"] = round(float(x.get("market_value") or 0), 2)
+            output.append(x)
+        output.sort(key=lambda r: r["market_value"], reverse=True)
+        return output
+    return json.dumps({
+        "total_cash": round(total_cash, 2),
+        "total_market_value": round(total_mv, 2),
+        "total_assets": round(total_assets, 2),
+        "stock_exposure": finalize(list(stock_exposure.values()), ("agents",))[:15],
+        "sector_exposure": finalize(list(sector_exposure.values()), ("stocks", "agents"))[:15],
+        "agent_exposure": finalize(list(agent_exposure.values()), tuple())[:10],
+        "warnings": [
+            "单一板块全局暴露超过45%时，应降低新开仓或换方向"
+            if any((float(x.get("market_value") or 0) / total_assets * 100 if total_assets else 0) > 45 for x in sector_exposure.values())
+            else "暂无明显全局板块集中度告警"
+        ],
+    }, ensure_ascii=False, default=str)
 
 
 @tool
@@ -759,15 +1297,22 @@ def get_strategy_param_schema(strategy_name: str = "") -> str:
 # 所有工具列表
 AGENT_TOOLS = [
     search_stocks_by_strategy,
+    search_stocks_by_strategy_combo,
     get_agent_stock_pool,
     search_stocks_in_agent_pool,
+    search_stocks_in_agent_pool_combo,
     get_stock_kline,
+    get_multi_period_trend,
     get_market_overview,
     get_company_business,
     compute_sector_heat_tool,
     get_market_strength_sectors,
     get_market_breadth,
     get_sector_temperature,
+    suggest_adaptive_strategy_params,
+    detect_strategy_crowding,
+    get_agent_signal_committee,
+    get_global_position_exposure,
     get_macro_daily_report,
     get_macro_market_topic,
     get_stock_chip_distribution,
@@ -790,14 +1335,21 @@ AGENT_TOOLS = [
 
 _TOOL_CATEGORIES = {
     "search_stocks_by_strategy": "选股",
+    "search_stocks_by_strategy_combo": "选股",
     "get_agent_stock_pool": "选股",
     "search_stocks_in_agent_pool": "选股",
+    "search_stocks_in_agent_pool_combo": "选股",
     "get_stock_kline": "行情",
+    "get_multi_period_trend": "行情",
     "get_market_overview": "行情",
     "compute_sector_heat_tool": "行情",
     "get_market_strength_sectors": "行情",
     "get_market_breadth": "行情",
     "get_sector_temperature": "行情",
+    "suggest_adaptive_strategy_params": "选股",
+    "detect_strategy_crowding": "多Agent协作",
+    "get_agent_signal_committee": "多Agent协作",
+    "get_global_position_exposure": "多Agent协作",
     "get_macro_daily_report": "行情",
     "get_macro_market_topic": "行情",
     "get_stock_chip_distribution": "行情",
@@ -832,6 +1384,8 @@ _MANDATORY_TOOL_NAMES = {
     "get_macro_market_topic",
     "get_strategy_param_schema",
     "get_agent_stock_pool",
+    "get_agent_signal_committee",
+    "get_global_position_exposure",
 }
 
 
