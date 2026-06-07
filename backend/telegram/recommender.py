@@ -71,6 +71,25 @@ def _context_key(chat_id: str, user_id: str = "") -> str:
     return profile_scope_id(chat_id or "local", user_id or "")
 
 
+def _memory_progress_payload(memory_context: dict) -> dict:
+    session_summary = memory_context.get("session_summary") or {}
+    memories = memory_context.get("long_term_memories") or memory_context.get("memories") or []
+    preview = []
+    for item in memories[:3]:
+        content = item.get("content") if isinstance(item, dict) else item
+        content = str(content or "").strip()
+        if content:
+            preview.append(content[:120])
+    return {
+        "type": "memory_context",
+        "short_count": len(memory_context.get("short_term_messages") or []),
+        "memory_count": len(memories),
+        "has_session_summary": bool(session_summary.get("summary")),
+        "session_summary": str(session_summary.get("summary") or "")[:160],
+        "memory_preview": preview,
+    }
+
+
 def _guess_intent(text: str) -> str:
     raw = text or ""
     lower = raw.lower()
@@ -767,6 +786,7 @@ def format_recommendation(query: str, max_results: int | None = None,
         progress_callback({
             "type": "tool_start",
             "tool": "recommend_search_stocks",
+            "description": "按自然语言策略筛选候选股票。",
             "args": {"strategy": parsed.get("strategy"), "max_results": requested},
         })
     result = natural_language_select(enriched_query, requested)
@@ -774,12 +794,18 @@ def format_recommendation(query: str, max_results: int | None = None,
         progress_callback({
             "type": "tool",
             "tool": "recommend_search_stocks",
+            "description": "按自然语言策略筛选候选股票。",
             "args": {"strategy": result.get("strategy"), "total": result.get("total")},
         })
     rows = result.get("results") or []
     public_context = best_public_agent_context()
     if progress_callback:
-        progress_callback({"type": "tool", "tool": "recommend_get_trader_memory", "args": {}})
+        progress_callback({
+            "type": "tool",
+            "tool": "recommend_get_trader_memory",
+            "description": "读取交易员体系、赛马表现和推荐技能记忆。",
+            "args": {},
+        })
 
     if not rows:
         return (
@@ -1101,6 +1127,8 @@ def _run_rule_recommendation(
     if progress_callback:
         progress_callback({"type": "rule_start", "query": query, "mode": reason})
     memory_context = build_memory_prompt(chat_id or "local", user_id, thread_id, query, None, 6)
+    if progress_callback:
+        progress_callback(_memory_progress_payload(memory_context))
     profile = get_profile(_context_key(chat_id or "local", user_id))
     reply = format_recommendation(
         query,
@@ -1206,12 +1234,7 @@ def _run_recommend_loop(
         progress_callback({"type": "phase", "message": "加载短期上下文、中期会话摘要和长期记忆。"})
     memory_context = build_memory_prompt(chat_id or "local", user_id, thread_id, user_input, None, 8)
     if progress_callback:
-        progress_callback({
-            "type": "memory_context",
-            "short_count": len(memory_context.get("short_term_messages") or []),
-            "memory_count": len(memory_context.get("long_term_memories") or []),
-            "has_session_summary": bool((memory_context.get("session_summary") or {}).get("summary")),
-        })
+        progress_callback(_memory_progress_payload(memory_context))
         progress_callback({"type": "phase", "message": "启动 ReAct 工具循环，按证据生成回复。"})
     result = ReActLoop(
         llm,
@@ -1590,12 +1613,22 @@ def _handle_text_message_inner(
         if not codes:
             return "没识别到具体股票。可以发: 京东方A如何看，或 /analyze 000725.SZ"
         if progress_callback:
-            progress_callback({"type": "tool_start", "tool": "recommend_analyze_stock", "args": {"codes": codes[:3]}})
+            progress_callback({
+                "type": "tool_start",
+                "tool": "recommend_analyze_stock",
+                "description": "分析单只股票的技术面、趋势、风险和推荐理由。",
+                "args": {"codes": codes[:3]},
+            })
         reports = [generate_stock_report(code, profile) for code in codes[:3]]
         for code in codes[:3]:
             _record_interest_quietly(chat_id or "local", username, code, raw, "single_stock_analysis", profile, user_id, thread_id)
         if progress_callback:
-            progress_callback({"type": "tool", "tool": "recommend_analyze_stock", "args": {"count": len(reports)}})
+            progress_callback({
+                "type": "tool",
+                "tool": "recommend_analyze_stock",
+                "description": "分析单只股票的技术面、趋势、风险和推荐理由。",
+                "args": {"count": len(reports)},
+            })
         return "\n\n---\n\n".join(reports)
 
     if lower.startswith(("/compare", "compare", "对比", "比较")):

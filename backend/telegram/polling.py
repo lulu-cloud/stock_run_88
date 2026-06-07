@@ -95,7 +95,14 @@ class _TelegramProgress:
             short_count = int(event.get("short_count") or 0)
             memory_count = int(event.get("memory_count") or 0)
             has_summary = "有" if event.get("has_session_summary") else "无"
-            return f"加载记忆: 短期{short_count}条 / 长期{memory_count}条 / 会话摘要{has_summary}"
+            lines = [f"加载记忆: 短期{short_count}条 / 长期{memory_count}条 / 会话摘要{has_summary}"]
+            summary = self._clip(event.get("session_summary") or "", 90)
+            if summary:
+                lines.append(f"会话摘要: {summary}")
+            memories = [self._clip(x, 72) for x in (event.get("memory_preview") or []) if str(x).strip()]
+            if memories:
+                lines.append("相关记忆: " + "；".join(memories[:2]))
+            return "\n".join(lines)
         if event_type == "rule_start":
             return "已识别为规则选股请求，准备调用选股工具。"
         if event_type == "strategy_parse":
@@ -105,11 +112,16 @@ class _TelegramProgress:
         if event_type == "tool_start":
             tool = event.get("tool") or "unknown_tool"
             args = self._format_args(event.get("args") or {})
-            return f"正在调用工具: {tool}{args}"
+            desc = self._clip(event.get("description") or self._known_tool_description(tool), 110)
+            lines = [f"正在调用工具: {tool}{args}"]
+            if desc:
+                lines.append(f"用途: {desc}")
+            return "\n".join(lines)
         if event_type == "tool":
             tool = event.get("tool") or "unknown_tool"
             suffix = "失败" if event.get("error") else "完成"
-            return f"工具{suffix}: {tool}"
+            desc = self._clip(event.get("description") or self._known_tool_description(tool), 90)
+            return f"工具{suffix}: {tool}" + (f"\n结果来源: {desc}" if desc and not event.get("error") else "")
         if event_type == "llm_turn":
             turn = event.get("turn") or ""
             stage_tools = event.get("stage_tools") or []
@@ -117,7 +129,13 @@ class _TelegramProgress:
         if event_type == "llm_decision":
             tools = [x for x in (event.get("tools") or []) if x]
             if tools:
-                return "决策: 需要调用 " + "、".join(tools[:4])
+                descriptions = event.get("tool_descriptions") or {}
+                lines = ["决策: 需要调用 " + "、".join(tools[:4])]
+                for name in tools[:3]:
+                    desc = self._clip(descriptions.get(name) or self._known_tool_description(name), 72)
+                    if desc:
+                        lines.append(f"- {name}: {desc}")
+                return "\n".join(lines)
             return "决策: 已有证据足够，准备组织回复"
         if event_type == "finalizing":
             return "正在整合证据，生成最终回复"
@@ -128,6 +146,32 @@ class _TelegramProgress:
             return ""
         keys = [str(k) for k in list(args.keys())[:3]]
         return " (" + ", ".join(keys) + ")"
+
+    def _clip(self, text: str, limit: int) -> str:
+        value = " ".join(str(text or "").split())
+        if len(value) <= limit:
+            return value
+        return value[: max(0, limit - 1)] + "…"
+
+    def _known_tool_description(self, tool_name: str) -> str:
+        descriptions = {
+            "recommend_search_stocks": "按自然语言策略筛选候选股票。",
+            "recommend_analyze_stock": "分析单只股票的技术面、趋势、风险和推荐理由。",
+            "recommend_compare_stocks": "对比多只股票的强弱、风险和适配度。",
+            "recommend_check_ma_bullish": "判断股票是否符合多头均线发散或多头排列。",
+            "recommend_price_volume_trend": "分析最近价格和成交量趋势。",
+            "recommend_get_market_topic": "读取宏观报告中的指定主题，如北向资金、龙虎榜、涨停板质量。",
+            "recommend_get_macro_report": "读取每日宏观市场报告。",
+            "recommend_get_trader_memory": "读取交易员体系、赛马表现和推荐技能记忆。",
+            "recommend_get_user_profile": "读取当前 Telegram 用户画像。",
+            "recommend_get_watchlist": "读取当前用户关注股列表。",
+            "recommend_get_stock_chip_distribution": "模拟个股筹码峰和成本分布。",
+            "recommend_get_stock_fundamental_events": "读取个股业绩预告/业绩快报等基本面事件。",
+            "recommend_find_ma_bullish_pullback": "筛选多头均线发散且回踩均线的股票。",
+            "recommend_get_policy_preference": "读取近期政策偏好的产业方向。",
+            "recommend_record_stock_interest": "记录用户提及或推荐过的股票，沉淀共享研究报告。",
+        }
+        return descriptions.get(str(tool_name or ""), "")
 
 
 def get_polling_status() -> dict:

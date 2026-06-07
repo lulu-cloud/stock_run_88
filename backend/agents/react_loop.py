@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -137,10 +138,15 @@ class ReActLoop:
         for turn in range(max_turns):
             current_tools = self._tools_for_turn(turn, stage_config)
             tool_map = {getattr(t, "name", ""): t for t in current_tools}
+            tool_descriptions = {
+                name: self._tool_description(tool)
+                for name, tool in tool_map.items()
+            }
             self._emit_event(event_callback, {
                 "type": "llm_turn",
                 "turn": turn + 1,
                 "stage_tools": list(tool_map.keys()),
+                "stage_tool_descriptions": tool_descriptions,
             })
             llm_with_tools = self.llm.bind_tools(current_tools) if current_tools else self.llm
             response, llm_latency_ms, attempts, llm_error = invoke_llm_with_retry(llm_with_tools, messages, log_path)
@@ -194,6 +200,7 @@ class ReActLoop:
                 "turn": turn + 1,
                 "tool_count": len(tool_calls),
                 "tools": [tc.get("name", "") for tc in tool_calls],
+                "tool_descriptions": tool_descriptions,
                 "has_visible_content": has_content,
             })
             if not tool_calls and not has_content:
@@ -224,6 +231,7 @@ class ReActLoop:
                 tool_args = tc.get("args", {})
                 tool_id = tc.get("id", "")
                 tool_fn = tool_map.get(tool_name)
+                tool_desc = self._tool_description(tool_fn) if tool_fn else ""
                 if tool_fn:
                     try:
                         tool_started = time.perf_counter()
@@ -231,6 +239,7 @@ class ReActLoop:
                             "type": "tool_start",
                             "turn": turn + 1,
                             "tool": tool_name,
+                            "description": tool_desc,
                             "args": tool_args,
                         })
                         result = tool_fn.invoke(tool_args)
@@ -267,6 +276,7 @@ class ReActLoop:
                     "type": "tool",
                     "turn": turn + 1,
                     "tool": tool_name,
+                    "description": tool_desc,
                     "args": tool_args,
                     "error": tool_error,
                 })
@@ -340,3 +350,11 @@ class ReActLoop:
             callback({**self.metadata, **item})
         except Exception:
             pass
+
+    def _tool_description(self, tool) -> str:
+        if not tool:
+            return ""
+        desc = (getattr(tool, "description", "") or getattr(tool, "__doc__", "") or "").strip()
+        if not desc:
+            return ""
+        return re.sub(r"\s+", " ", desc.splitlines()[0]).strip()[:160]
