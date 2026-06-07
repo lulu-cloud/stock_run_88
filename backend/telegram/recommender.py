@@ -1215,6 +1215,7 @@ def _handle_text_message_inner(
             "/watch add 600000.SH / /watch list / /watch remove 600000.SH\n"
             "/daily on / /daily off\n"
             "/memory 查看记忆 / /memory forget 关键词\n"
+            "/login 获取看板登录验证码 / /whoami 查看 Telegram 身份\n"
             "/status 1\n"
             "/sim 1\n"
             "/bind 1\n"

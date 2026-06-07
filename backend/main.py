@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from backend.auth import DashboardAuthMiddleware
 
 app = FastAPI(title="A股多Agent智能投顾系统", version="0.1.0")
 
@@ -203,6 +204,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(DashboardAuthMiddleware)
 
 
 @app.get("/api/health")
@@ -256,7 +258,9 @@ from backend.api.company_routes import router as company_router
 from backend.api.policy_routes import router as policy_router
 from backend.api.simulation_routes import router as simulation_router
 from backend.api.telegram_routes import router as telegram_router
+from backend.auth import router as auth_router
 
+app.include_router(auth_router)
 app.include_router(strategy_router)
 app.include_router(agent_router)
 app.include_router(market_router)

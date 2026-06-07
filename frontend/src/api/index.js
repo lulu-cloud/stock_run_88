@@ -1,6 +1,25 @@
 import axios from 'axios'
 
-const api = axios.create({ baseURL: '/api' })
+const api = axios.create({ baseURL: '/api', withCredentials: true })
+
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error?.response?.status === 401 && window.location.pathname !== '/login') {
+      const next = encodeURIComponent(window.location.pathname + window.location.search)
+      window.location.href = `/login?next=${next}`
+    }
+    return Promise.reject(error)
+  },
+)
+
+export const authAPI = {
+  me: () => api.get('/auth/me'),
+  status: () => api.get('/auth/status'),
+  verifyCode: (code) => api.post('/auth/verify-code', { code }),
+  loginPassword: (password) => api.post('/auth/login-password', { password }),
+  logout: () => api.post('/auth/logout'),
+}
 
 export const agentAPI = {
   list: () => api.get('/agent/list'),

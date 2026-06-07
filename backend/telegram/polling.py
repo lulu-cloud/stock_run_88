@@ -22,6 +22,7 @@ from backend.telegram.gateway import (
     send_message,
 )
 from backend.telegram.recommender import handle_text_message
+from backend.auth import generate_login_code, format_login_code_message, is_allowed_telegram_user
 
 
 _state = {
@@ -124,6 +125,24 @@ def _handle_update(update: dict):
     thread_id = str(message.get("message_thread_id") or "default")
     chat_type = str(chat.get("type") or "")
     if not text or not chat_id:
+        return
+    lower = text.strip().lower()
+    if lower.startswith("/whoami"):
+        allowed = "是" if is_allowed_telegram_user(user_id, username) else "否"
+        send_message(
+            chat_id,
+            "Telegram 身份\n\n"
+            f"user_id: {user_id}\n"
+            f"chat_id: {chat_id}\n"
+            f"username: {username or '-'}\n"
+            f"看板白名单: {allowed}",
+        )
+        _state["last_message"] = text[:200]
+        return
+    if lower.startswith("/login"):
+        result = generate_login_code(user_id, chat_id, username)
+        send_message(chat_id, format_login_code_message(result, user_id))
+        _state["last_message"] = text[:200]
         return
     progress = _TelegramProgress(chat_id)
     try:

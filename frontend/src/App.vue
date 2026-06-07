@@ -1,6 +1,6 @@
 <template>
   <div id="app-container">
-    <nav class="top-nav">
+    <nav v-if="!isLoginPage" class="top-nav">
       <div class="nav-brand">
         <span class="brand-mark">◆</span>
         <h1 class="logo">A股多Agent<span class="logo-accent">智能投顾</span></h1>
@@ -30,6 +30,11 @@
 </template>
 
 <script setup>
+import { computed } from 'vue'
+import { useRoute } from 'vue-router'
+
+const route = useRoute()
+const isLoginPage = computed(() => route.name === 'Login')
 </script>
 
 <style>

@@ -522,6 +522,34 @@ CREATE TABLE IF NOT EXISTS system_settings (
     updated_at TEXT DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS auth_login_code (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    code_hash         TEXT NOT NULL UNIQUE,
+    telegram_user_id  TEXT NOT NULL,
+    chat_id           TEXT,
+    username          TEXT,
+    expires_at        TEXT NOT NULL,
+    used_at           TEXT,
+    attempt_count     INTEGER DEFAULT 0,
+    created_at        TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS auth_session (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_hash      TEXT NOT NULL UNIQUE,
+    telegram_user_id  TEXT NOT NULL,
+    username          TEXT,
+    expires_at        TEXT NOT NULL,
+    revoked_at        TEXT,
+    created_at        TEXT DEFAULT (datetime('now')),
+    last_seen_at      TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_login_code_user
+    ON auth_login_code(telegram_user_id, expires_at, used_at);
+CREATE INDEX IF NOT EXISTS idx_auth_session_hash
+    ON auth_session(session_hash, expires_at, revoked_at);
+
 CREATE TABLE IF NOT EXISTS simulation_task (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     name            TEXT,
