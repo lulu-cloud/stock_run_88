@@ -17,6 +17,7 @@
       <div class="nav-status">
         <span class="status-dot"></span>
         LIVE
+        <button class="logout-btn" type="button" @click="logout">退出</button>
       </div>
     </nav>
     <main class="main-content">
@@ -32,9 +33,18 @@
 <script setup>
 import { computed } from 'vue'
 import { useRoute } from 'vue-router'
+import { authAPI } from './api'
 
 const route = useRoute()
 const isLoginPage = computed(() => route.name === 'Login')
+
+async function logout() {
+  try {
+    await authAPI.logout()
+  } finally {
+    window.location.href = '/login'
+  }
+}
 </script>
 
 <style>
@@ -91,6 +101,18 @@ body {
   font-size: 11px; color: var(--accent-green); letter-spacing: 2px;
 }
 .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent-green); animation: pulse 2s infinite; }
+.logout-btn {
+  margin-left: 8px;
+  border: 1px solid var(--border);
+  background: #fff;
+  color: var(--text-secondary);
+  border-radius: 5px;
+  padding: 4px 8px;
+  cursor: pointer;
+  font-size: 11px;
+  letter-spacing: 0;
+}
+.logout-btn:hover { border-color: var(--accent-gold); color: var(--accent-gold); }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
 
 .main-content { padding: 24px 28px; max-width: 1560px; margin: 0 auto; }
