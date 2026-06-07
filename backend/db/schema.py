@@ -545,6 +545,13 @@ CREATE TABLE IF NOT EXISTS auth_session (
     last_seen_at      TEXT DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS auth_rate_limit (
+    key_hash          TEXT PRIMARY KEY,
+    count             INTEGER DEFAULT 0,
+    reset_at          TEXT NOT NULL,
+    updated_at        TEXT DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_auth_login_code_user
     ON auth_login_code(telegram_user_id, expires_at, used_at);
 CREATE INDEX IF NOT EXISTS idx_auth_session_hash

@@ -3,6 +3,11 @@ stock_run_88/
 __pycache__/
 *.pyc
 .DS_Store
+.idea/
+.claude/
+.vite/
+test-results/
+frontend/test-results/
 node_modules/
 frontend/dist/
 *.db

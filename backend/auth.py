@@ -8,6 +8,7 @@ deployment, while an optional env password can be kept as a recovery path.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -25,6 +26,12 @@ AUTH_COOKIE_NAME = os.environ.get("AUTH_COOKIE_NAME", "stock_run_session")
 AUTH_CODE_TTL_SECONDS = int(os.environ.get("AUTH_CODE_TTL_SECONDS", "300"))
 AUTH_SESSION_DAYS = int(os.environ.get("AUTH_SESSION_DAYS", "7"))
 AUTH_MAX_CODE_ATTEMPTS = int(os.environ.get("AUTH_MAX_CODE_ATTEMPTS", "5"))
+AUTH_VERIFY_RATE_LIMIT = int(os.environ.get("AUTH_VERIFY_RATE_LIMIT", "20"))
+AUTH_VERIFY_RATE_WINDOW_SECONDS = int(os.environ.get("AUTH_VERIFY_RATE_WINDOW_SECONDS", "600"))
+AUTH_PASSWORD_RATE_LIMIT = int(os.environ.get("AUTH_PASSWORD_RATE_LIMIT", "10"))
+AUTH_PASSWORD_RATE_WINDOW_SECONDS = int(os.environ.get("AUTH_PASSWORD_RATE_WINDOW_SECONDS", "600"))
+_EPHEMERAL_AUTH_SECRET = secrets.token_urlsafe(32)
+logger = logging.getLogger(__name__)
 
 _PUBLIC_PREFIXES = (
     "/api/auth/",
@@ -63,12 +70,11 @@ def _iso(value: datetime) -> str:
 
 
 def _secret() -> str:
-    return (
-        os.environ.get("AUTH_SECRET")
-        or TELEGRAM_BOT_TOKEN
-        or os.environ.get("DASHBOARD_ADMIN_PASSWORD")
-        or "stock-run-auth-dev-secret"
-    )
+    configured = os.environ.get("AUTH_SECRET") or TELEGRAM_BOT_TOKEN or os.environ.get("DASHBOARD_ADMIN_PASSWORD")
+    if configured:
+        return configured
+    logger.warning("AUTH_SECRET/TELEGRAM_BOT_TOKEN is not configured; using ephemeral per-process auth secret")
+    return _EPHEMERAL_AUTH_SECRET
 
 
 def _hash(value: str) -> str:
@@ -279,6 +285,43 @@ def _verify_password(password: str) -> bool:
     return bool(configured) and secrets.compare_digest(password or "", configured)
 
 
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _check_rate_limit(key: str, limit: int, window_seconds: int) -> bool:
+    now = _now()
+    key_hash = _hash(f"rate:{key}")
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT count, reset_at FROM auth_rate_limit WHERE key_hash=?", (key_hash,)).fetchone()
+        reset_at = _dt(row["reset_at"]) if row else None
+        if not row or not reset_at or reset_at <= now:
+            conn.execute(
+                """INSERT INTO auth_rate_limit (key_hash, count, reset_at, updated_at)
+                   VALUES (?, 1, ?, datetime('now'))
+                   ON CONFLICT(key_hash) DO UPDATE SET
+                   count=1, reset_at=excluded.reset_at, updated_at=datetime('now')""",
+                (key_hash, _iso(now + timedelta(seconds=window_seconds))),
+            )
+            conn.commit()
+            return True
+        count = int(row["count"] or 0)
+        if count >= limit:
+            return False
+        conn.execute(
+            "UPDATE auth_rate_limit SET count=count+1, updated_at=datetime('now') WHERE key_hash=?",
+            (key_hash,),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
@@ -308,7 +351,9 @@ async def auth_status():
 
 
 @router.post("/verify-code")
-async def auth_verify_code(req: VerifyCodeRequest, response: Response):
+async def auth_verify_code(req: VerifyCodeRequest, request: Request, response: Response):
+    if not _check_rate_limit(f"verify:{_client_ip(request)}", AUTH_VERIFY_RATE_LIMIT, AUTH_VERIFY_RATE_WINDOW_SECONDS):
+        raise HTTPException(status_code=429, detail="验证码尝试过于频繁，请稍后再试")
     identity = _verify_login_code(req.code)
     if not identity:
         raise HTTPException(status_code=401, detail="验证码无效或已过期")
@@ -318,7 +363,9 @@ async def auth_verify_code(req: VerifyCodeRequest, response: Response):
 
 
 @router.post("/login-password")
-async def auth_login_password(req: PasswordLoginRequest, response: Response):
+async def auth_login_password(req: PasswordLoginRequest, request: Request, response: Response):
+    if not _check_rate_limit(f"password:{_client_ip(request)}", AUTH_PASSWORD_RATE_LIMIT, AUTH_PASSWORD_RATE_WINDOW_SECONDS):
+        raise HTTPException(status_code=429, detail="密码尝试过于频繁，请稍后再试")
     if not _verify_password(req.password):
         raise HTTPException(status_code=401, detail="密码错误")
     token, expires_at = _create_session("password-admin", "admin")

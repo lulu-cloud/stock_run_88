@@ -3,6 +3,7 @@
 import os
 import time
 import threading
+import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from fastapi import FastAPI
@@ -10,6 +11,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.auth import DashboardAuthMiddleware
 
 app = FastAPI(title="A股多Agent智能投顾系统", version="0.1.0")
+logger = logging.getLogger(__name__)
+
+
+def _cors_allow_origins() -> list[str]:
+    raw = os.environ.get("CORS_ALLOW_ORIGINS", "")
+    if raw.strip():
+        return [origin.strip() for origin in raw.replace(";", ",").split(",") if origin.strip()]
+    return [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:18000",
+        "http://127.0.0.1:18000",
+    ]
 
 # 调度器状态
 _scheduler_state = {"running": False, "last_check": "", "last_result": None, "interval_minutes": 5}
@@ -199,7 +213,7 @@ async def startup_init_db():
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_allow_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
