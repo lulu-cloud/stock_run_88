@@ -7,7 +7,7 @@ import baostock as bs
 from typing import Optional
 from datetime import date
 
-from backend.config import DAILY_DIR, INDEX_DIR, MA_PERIODS
+from backend.config import DAILY_DIR, INDEX_DIR, MA_PERIODS, BAOSTOCK_ADJUSTFLAG_DAILY
 from backend.data.loader import get_latest_date, compute_mas, compute_limit_status
 
 
@@ -28,7 +28,7 @@ def _fetch_raw(ts_code: str, start_date: str, end_date_fmt: str) -> Optional[pd.
     rs = bs.query_history_k_data_plus(
         ts_code, fields,
         start_date=start_date, end_date=end_date_fmt,
-        frequency="d", adjustflag="2",
+        frequency="d", adjustflag=BAOSTOCK_ADJUSTFLAG_DAILY,
     )
     if rs.error_code != "0":
         return None

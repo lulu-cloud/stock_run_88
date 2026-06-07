@@ -19,7 +19,7 @@ from backend.data.loader import (
 )
 from backend.strategies.registry import StrategyRegistry
 from backend.trading.rules import (
-    is_one_side_limit, calc_buy_fee, calc_sell_fee,
+    is_one_side_limit, calc_buy_fee, calc_sell_fee, is_st_value,
 )
 from backend.trading.calculator import calc_cumulative_return
 from backend.backtest.metrics import compute_metrics
@@ -240,7 +240,7 @@ def _process_sell_with_log(position: dict, cash: float, stock_data: dict,
         return cash
 
     # 一字板跌停无法卖出
-    if is_one_side_limit(open_p, high_p, low_p, close_p, pct):
+    if is_one_side_limit(open_p, high_p, low_p, close_p, pct, is_st_value(row.get("is_st", 0))):
         logger.skip(trade_date, ts_code, f"一字板无法卖出 ({sell_reason})", pct=pct)
         return cash
 
@@ -283,7 +283,7 @@ def _process_buy_with_log(cash: float, stock_data: dict, trade_date: str,
         open_p, high_p, low_p, close_p = row["open"], row["high"], row["low"], row["close"]
         pct = row.get("pct_chg", 0)
 
-        if is_one_side_limit(open_p, high_p, low_p, close_p, pct):
+        if is_one_side_limit(open_p, high_p, low_p, close_p, pct, is_st_value(row.get("is_st", 0))):
             logger.skip(trade_date, ts_code, "一字板涨停，无法买入", pct=pct)
             continue
 

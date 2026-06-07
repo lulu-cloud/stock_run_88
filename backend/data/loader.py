@@ -1,12 +1,13 @@
 """CSV 数据加载器"""
 
 import os
+from functools import lru_cache
 import pandas as pd
 from typing import Optional
-from backend.config import DAILY_DIR, INDEX_DIR, MA_PERIODS
-from backend.trading.rules import is_main_board, normalize_ts_code
+from backend.config import DAILY_DIR, INDEX_DIR, MA_PERIODS, DAILY_PRICE_ADJUSTMENT
+from backend.trading.rules import is_main_board, normalize_ts_code, is_st_stock, is_st_value
 
-NUMERIC_DAILY_COLUMNS = ["open", "high", "low", "close", "pre_close", "vol", "amount", "turnover_rate", "pct_chg"]
+NUMERIC_DAILY_COLUMNS = ["open", "high", "low", "close", "pre_close", "vol", "amount", "turnover_rate", "pct_chg", "is_st"]
 
 
 def _coerce_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -17,25 +18,63 @@ def _coerce_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def list_main_board_stocks() -> pd.DataFrame:
-    """加载主板股票列表，严格排除指数、基金、债券等非个股代码。"""
+@lru_cache(maxsize=8192)
+def latest_is_st(ts_code: str) -> bool:
+    """Read the latest official baostock isST flag from local qfq daily CSV."""
+    code = normalize_ts_code(ts_code)
+    filepath = os.path.join(DAILY_DIR, f"{code}_daily.csv")
+    if not os.path.exists(filepath):
+        return False
+    try:
+        df = pd.read_csv(filepath, usecols=["is_st"])
+        if df.empty:
+            return False
+        return is_st_value(df.iloc[-1].get("is_st"))
+    except Exception:
+        return False
+
+
+@lru_cache(maxsize=4)
+def _list_main_board_stock_records(include_st: bool = False) -> tuple[tuple[tuple[str, object], ...], ...]:
     basic = pd.read_csv(os.path.join(os.path.dirname(DAILY_DIR), "stock_basic_cache.csv"))
-    rows = []
+    records = []
     for _, row in basic.iterrows():
+        official_st = row.get("is_st", row.get("isST", None))
+        if official_st is None or (isinstance(official_st, float) and pd.isna(official_st)):
+            official_st = latest_is_st(row.get("ts_code", ""))
+        st_flag = is_st_value(official_st) or is_st_stock(row.get("name", ""))
+        if st_flag and not include_st:
+            continue
         if is_main_board(
             row.get("ts_code", ""),
             row.get("name", ""),
             row.get("market", ""),
             row.get("status", ""),
+            st_flag,
+            allow_st=bool(include_st),
         ):
-            rows.append(row)
+            records.append(tuple(row.to_dict().items()))
+    return tuple(records)
+
+
+def list_main_board_stocks(include_st: bool = False) -> pd.DataFrame:
+    """加载主板股票列表，严格排除指数、基金、债券等非个股代码。
+
+    默认排除 ST。优先使用 stock_basic_cache 里的 is_st/isST 字段；若不存在，
+    则使用 baostock 日线 CSV 最新 is_st 字段兜底，最后再用名称中的 ST 兜底。
+    """
+    rows = [dict(items) for items in _list_main_board_stock_records(bool(include_st))]
     if not rows:
+        basic = pd.read_csv(os.path.join(os.path.dirname(DAILY_DIR), "stock_basic_cache.csv"))
         return basic.iloc[0:0].copy()
     return pd.DataFrame(rows).reset_index(drop=True)
 
 
 def load_daily(ts_code: str) -> Optional[pd.DataFrame]:
-    """加载单只股票的日线数据"""
+    """加载单只股票日线数据。
+
+    价格口径为 baostock 前复权，即 config.DAILY_PRICE_ADJUSTMENT == "qfq"。
+    """
     ts_code = normalize_ts_code(ts_code)
     filepath = os.path.join(DAILY_DIR, f"{ts_code}_daily.csv")
     if not os.path.exists(filepath):
@@ -99,10 +138,28 @@ def compute_pct_chg(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_limit_status(df: pd.DataFrame) -> pd.DataFrame:
-    """判断涨停/跌停状态（±10% 或 ST ±5%）"""
+    """判断涨停/跌停状态。
+
+    普通主板按 ±10%（阈值 9.8%），ST 按 ±5%（阈值 4.9%）。
+    数据价格口径为前复权，但 pct_chg/is_st 直接来自 baostock 官方日线字段。
+    """
     df = df.copy()
     if "pct_chg" in df.columns:
         df["pct_chg"] = pd.to_numeric(df["pct_chg"], errors="coerce").fillna(0)
-    df["is_limit_up"] = df["pct_chg"] >= 9.9
-    df["is_limit_down"] = df["pct_chg"] <= -9.9
+    else:
+        df = compute_pct_chg(df)
+    if "is_st" in df.columns:
+        st_flags = pd.to_numeric(df["is_st"], errors="coerce").fillna(0).astype(int) == 1
+    else:
+        st_flags = pd.Series(False, index=df.index)
+    up_threshold = st_flags.map(lambda x: 4.9 if x else 9.8)
+    down_threshold = st_flags.map(lambda x: -4.9 if x else -9.8)
+    df["limit_threshold_pct"] = st_flags.map(lambda x: 5.0 if x else 10.0)
+    df["is_limit_up"] = df["pct_chg"] >= up_threshold
+    df["is_limit_down"] = df["pct_chg"] <= down_threshold
     return df
+
+
+def daily_price_adjustment() -> str:
+    """Return the daily price adjustment basis used by strategies/backtests."""
+    return DAILY_PRICE_ADJUSTMENT

@@ -8,11 +8,11 @@ import pandas as pd
 from typing import Optional
 from collections import Counter
 from backend.config import DAILY_DIR, MA_PERIODS
-from backend.trading.rules import is_main_board
+from backend.trading.rules import is_main_board, is_st_stock, is_st_value
 from backend.data.tags import load_tag_map
 
 
-NUMERIC_DAILY_COLUMNS = ["open", "high", "low", "close", "pre_close", "vol", "amount", "turnover_rate", "pct_chg"]
+NUMERIC_DAILY_COLUMNS = ["open", "high", "low", "close", "pre_close", "vol", "amount", "turnover_rate", "pct_chg", "is_st"]
 
 
 def _safe_float(value, default: float = 0.0) -> float:
@@ -30,6 +30,29 @@ def _coerce_daily_numeric(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
+
+
+def _row_is_st(row) -> bool:
+    return is_st_value(row.get("is_st", 0))
+
+
+def _truthy_flag(value) -> bool:
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "yes", "y"}
+
+
+def _row_is_limit_up(row) -> bool:
+    if "is_limit_up" in row and str(row.get("is_limit_up")) not in ("", "nan", "None"):
+        return _truthy_flag(row.get("is_limit_up"))
+    pct = _safe_float(row.get("pct_chg", 0))
+    return pct >= (4.9 if _row_is_st(row) else 9.8)
+
+
+def _row_is_limit_down(row) -> bool:
+    if "is_limit_down" in row and str(row.get("is_limit_down")) not in ("", "nan", "None"):
+        return _truthy_flag(row.get("is_limit_down"))
+    pct = _safe_float(row.get("pct_chg", 0))
+    return pct <= (-4.9 if _row_is_st(row) else -9.8)
 
 
 def compute_sector_heat(trade_date: str) -> list[dict]:
@@ -74,7 +97,7 @@ def compute_market_strength_by_sector(trade_date: str, lookback_days: int = 3,
     basic = pd.read_csv(os.path.join(os.path.dirname(DAILY_DIR), "stock_basic_cache.csv"))
     main_board = basic[
         basic.apply(
-            lambda r: is_main_board(r.get("ts_code", ""), r.get("name", ""), r.get("market", ""), r.get("status", "")),
+            lambda r: is_main_board(r.get("ts_code", ""), r.get("name", ""), r.get("market", ""), r.get("status", ""), r.get("is_st", None)),
             axis=1,
         )
     ]
@@ -102,7 +125,7 @@ def compute_market_strength_by_sector(trade_date: str, lookback_days: int = 3,
         if pd.isna(turnover):
             turnover = 0.0
         pct_series = pd.to_numeric(upto.get("pct_chg", pd.Series(dtype=float)), errors="coerce").fillna(0)
-        limit_up_days = int((pct_series >= 9.8).sum())
+        limit_up_days = int(sum(1 for _, recent_row in upto.iterrows() if _row_is_limit_up(recent_row)))
         tag = tag_map.get(ts_code, {})
         sector = tag.get("sector_tag") or tag.get("industry_tag") or "其他"
         stat = sectors.setdefault(sector, {
@@ -177,7 +200,7 @@ def compute_market_breadth(trade_date: str = "") -> dict:
     basic = pd.read_csv(os.path.join(os.path.dirname(DAILY_DIR), "stock_basic_cache.csv"))
     main_board = basic[
         basic.apply(
-            lambda r: is_main_board(r.get("ts_code", ""), r.get("name", ""), r.get("market", ""), r.get("status", "")),
+            lambda r: is_main_board(r.get("ts_code", ""), r.get("name", ""), r.get("market", ""), r.get("status", ""), r.get("is_st", None)),
             axis=1,
         )
     ]
@@ -202,6 +225,9 @@ def compute_market_breadth(trade_date: str = "") -> dict:
             "pct_chg": round(pct, 2),
             "amount": round(amount, 2),
             "turnover_rate": round(turnover, 2),
+            "is_st": _row_is_st(day),
+            "is_limit_up": _row_is_limit_up(day),
+            "is_limit_down": _row_is_limit_down(day),
         }
         rows.append(item)
         tag = tag_map.get(ts_code, {})
@@ -225,9 +251,9 @@ def compute_market_breadth(trade_date: str = "") -> dict:
         stat["amount_sum"] += amount
         stat["up_count"] += 1 if pct > 0 else 0
         stat["down_count"] += 1 if pct < 0 else 0
-        stat["limit_up_count"] += 1 if pct >= 9.8 else 0
+        stat["limit_up_count"] += 1 if item["is_limit_up"] else 0
         stat["big_up_count"] += 1 if pct >= 5.0 else 0
-        stat["limit_down_count"] += 1 if pct <= -9.8 else 0
+        stat["limit_down_count"] += 1 if item["is_limit_down"] else 0
         stat["big_down_count"] += 1 if pct <= -5.0 else 0
         stat["leaders"].append(item)
         stat["laggards"].append(item)
@@ -237,9 +263,9 @@ def compute_market_breadth(trade_date: str = "") -> dict:
     up_count = sum(1 for x in pct_values if x > 0)
     down_count = sum(1 for x in pct_values if x < 0)
     flat_count = total - up_count - down_count
-    limit_up_count = sum(1 for x in pct_values if x >= 9.8)
+    limit_up_count = sum(1 for x in rows if x.get("is_limit_up"))
     big_up_count = sum(1 for x in pct_values if x >= 5.0)
-    limit_down_count = sum(1 for x in pct_values if x <= -9.8)
+    limit_down_count = sum(1 for x in rows if x.get("is_limit_down"))
     big_down_count = sum(1 for x in pct_values if x <= -5.0)
     avg_pct = sum(pct_values) / total if total else 0.0
     median_pct = float(pd.Series(pct_values).median()) if pct_values else 0.0
@@ -322,7 +348,7 @@ def _aggregate_sector_data(trade_date: str) -> list[dict]:
     basic = pd.read_csv(os.path.join(os.path.dirname(DAILY_DIR), "stock_basic_cache.csv"))
     main_board = basic[
         basic.apply(
-            lambda r: is_main_board(r.get("ts_code", ""), r.get("name", ""), r.get("market", ""), r.get("status", "")),
+            lambda r: is_main_board(r.get("ts_code", ""), r.get("name", ""), r.get("market", ""), r.get("status", ""), r.get("is_st", None)),
             axis=1,
         )
     ]
@@ -347,7 +373,7 @@ def _aggregate_sector_data(trade_date: str) -> list[dict]:
         day_vol = _safe_float(day_data.iloc[0].get("vol", 0))
         volume_ratio = day_vol / avg_vol if avg_vol > 0 else 1.0
 
-        is_limit_up = _safe_float(day_data.iloc[0].get("pct_chg", 0)) >= 9.9
+        is_limit_up = _row_is_limit_up(day_data.iloc[0])
         consecutive = _count_consecutive_boards(df, day_data.index[0])
 
         for sector in sectors_list:
@@ -444,7 +470,7 @@ def _count_consecutive_boards(df: pd.DataFrame, idx: int) -> int:
     i = idx
     while i >= 0:
         row = df.iloc[i]
-        if _safe_float(row.get("pct_chg", 0)) >= 9.9:
+        if _row_is_limit_up(row):
             count += 1
             i -= 1
         else:

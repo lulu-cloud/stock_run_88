@@ -15,6 +15,7 @@ from typing import Optional
 from backend.data.loader import load_daily, load_index_daily, compute_mas, compute_limit_status
 from backend.trading.rules import (
     is_one_side_limit, calc_buy_fee, calc_sell_fee, can_buy, can_sell,
+    is_st_value,
 )
 from backend.trading.calculator import calc_cumulative_return
 from backend.backtest.metrics import compute_metrics
@@ -123,7 +124,7 @@ def _execute_order(agent: SimAgentState, order: dict, stock_data: dict,
     pct = price_info["pct_chg"]
 
     # 一字板检查
-    if is_one_side_limit(open_p, high_p, low_p, close_p, pct):
+    if is_one_side_limit(open_p, high_p, low_p, close_p, pct, is_st_value(price_info.get("is_st", 0))):
         return
 
     # 使用收盘价成交 (模拟按收盘价执行)

@@ -7,7 +7,7 @@ import sqlite3
 from typing import Optional
 from backend.trading.rules import (
     match_order_price, can_buy, can_sell,
-    calc_buy_fee, calc_sell_fee, is_one_side_limit,
+    calc_buy_fee, calc_sell_fee, is_one_side_limit, is_st_value,
 )
 from backend.trading.calculator import calc_weighted_avg_cost
 from backend.db.repository import (
@@ -61,9 +61,10 @@ def execute_orders(agent_id: int, trade_date: str,
         low_p = price_info["low"]
         close_p = price_info["close"]
         pct = price_info.get("pct_chg", 0)
+        is_st = is_st_value(price_info.get("is_st", 0))
 
         # 一字板检查
-        if is_one_side_limit(open_p, high_p, low_p, close_p, pct):
+        if is_one_side_limit(open_p, high_p, low_p, close_p, pct, is_st):
             direction_text = "涨停" if pct > 0 else "跌停"
             _expire_order(order, f"一字{direction_text}，当日禁止交易", conn)
             cash = refresh_cash()

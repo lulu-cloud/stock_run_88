@@ -42,6 +42,8 @@ JSON 字段：
   "hot_sectors": ["板块1", "板块2"],
   "risk_sectors": ["板块1", "板块2"],
   "limit_up_summary": "涨停/炸板/跌停情绪摘要",
+  "limit_board_quality": "基于封板资金、封板时间、炸板次数、连板数的板质量摘要",
+  "limit_promotion_signal": "昨日涨停晋级率、炸板率、闷杀率和短线情绪周期判断",
   "lhb_summary": "龙虎榜和机构/营业部资金摘要",
   "institution_signal": "机构席位信号",
   "policy_signal": "政策方向",
@@ -83,6 +85,169 @@ def _safe_records(df: pd.DataFrame | None, limit: int = 10, sort_by: str = "", r
         frame[sort_by] = pd.to_numeric(frame[sort_by], errors="coerce")
         frame = frame.sort_values(sort_by, ascending=not reverse)
     return _jsonable(frame.head(limit).to_dict(orient="records"))
+
+
+def _limit_code(item: dict) -> str:
+    code = str(item.get("代码") or item.get("股票代码") or item.get("ts_code") or "").strip()
+    return code[:6] if code else ""
+
+
+def _limit_name(item: dict) -> str:
+    return str(item.get("名称") or item.get("股票名称") or item.get("name") or "").strip()
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or pd.isna(value):
+            return default
+        text = str(value).strip()
+        if not text:
+            return default
+        return int(float(text))
+    except Exception:
+        return default
+
+
+def _parse_limit_time(value: Any) -> int:
+    """Return HHMMSS as an int-like sortable value."""
+    if value is None or pd.isna(value):
+        return 0
+    text = str(value).strip()
+    if not text:
+        return 0
+    if ":" in text:
+        parts = [p.zfill(2) for p in text.split(":")]
+        return _safe_int("".join(parts[:3]), 0)
+    digits = re.sub(r"\D", "", text)
+    if len(digits) <= 4:
+        digits = digits.zfill(4) + "00"
+    return _safe_int(digits[:6], 0)
+
+
+def _format_limit_time(value: Any) -> str:
+    parsed = _parse_limit_time(value)
+    if parsed <= 0:
+        return ""
+    text = f"{parsed:06d}"
+    return f"{text[:2]}:{text[2:4]}:{text[4:6]}"
+
+
+def _board_count(item: dict, previous: bool = False) -> int:
+    value = item.get("昨日连板数") if previous else item.get("连板数")
+    count = _safe_int(value, 0)
+    if count > 0:
+        return count
+    stat = str(item.get("涨停统计") or "")
+    match = re.search(r"(\d+)\s*/\s*(\d+)", stat)
+    if match:
+        return _safe_int(match.group(2), 0)
+    return 1 if _safe_float(item.get("涨跌幅"), 0) >= 9.8 else 0
+
+
+def _board_stage(board_count: int) -> str:
+    if board_count <= 1:
+        return "首板"
+    if board_count == 2:
+        return "二板"
+    if board_count == 3:
+        return "三板"
+    return "高位连板"
+
+
+def _board_quality(item: dict) -> dict:
+    first_time = _parse_limit_time(item.get("首次封板时间"))
+    last_time = _parse_limit_time(item.get("最后封板时间"))
+    broken_count = _safe_int(item.get("炸板次数", item.get("开板次数", 0)), 0)
+    seal_amount = _safe_float(item.get("封板资金", item.get("封单资金", 0)), 0.0)
+    board_count = _board_count(item)
+    score = 45.0
+    if first_time and first_time <= 100000:
+        score += 16
+    elif first_time and first_time <= 113000:
+        score += 10
+    elif first_time:
+        score += 3
+    if last_time and last_time <= 100000:
+        score += 10
+    elif last_time and last_time <= 143000:
+        score += 5
+    score += min(18.0, max(0.0, seal_amount) / 1e8 * 8)
+    score += min(12.0, max(0, board_count - 1) * 4)
+    score -= min(24.0, broken_count * 8)
+    score = max(0.0, min(100.0, score))
+    return {
+        "ts_code": _limit_code(item),
+        "name": _limit_name(item),
+        "pct_chg": _safe_float(item.get("涨跌幅"), 0),
+        "turnover_rate": _safe_float(item.get("换手率"), 0),
+        "first_seal_time": _format_limit_time(item.get("首次封板时间")),
+        "last_seal_time": _format_limit_time(item.get("最后封板时间")),
+        "seal_amount": seal_amount,
+        "broken_count": broken_count,
+        "board_count": board_count,
+        "board_stage": _board_stage(board_count),
+        "industry": item.get("所属行业") or "",
+        "quality_score": round(score, 2),
+    }
+
+
+def _limit_pool_analytics(result: dict) -> dict:
+    limit_items = result.get("limit_up_pool", {}).get("items") or result.get("limit_up_pool", {}).get("top") or []
+    previous_items = result.get("previous_limit_up_pool", {}).get("items") or result.get("previous_limit_up_pool", {}).get("top") or []
+    broken_items = result.get("broken_limit_up_pool", {}).get("items") or result.get("broken_limit_up_pool", {}).get("top") or []
+    limit_codes = {_limit_code(item) for item in limit_items if _limit_code(item)}
+    broken_codes = {_limit_code(item) for item in broken_items if _limit_code(item)}
+    qualities = [_board_quality(item) for item in limit_items]
+    qualities.sort(key=lambda x: (x["quality_score"], x["board_count"], -x["broken_count"]), reverse=True)
+    stage_counts: dict[str, int] = {}
+    for item in qualities:
+        stage_counts[item["board_stage"]] = stage_counts.get(item["board_stage"], 0) + 1
+    promoted = []
+    eliminated = []
+    killed = []
+    broken_from_previous = []
+    for item in previous_items:
+        code = _limit_code(item)
+        if not code:
+            continue
+        pct = _safe_float(item.get("涨跌幅"), 0)
+        row = {
+            "ts_code": code,
+            "name": _limit_name(item),
+            "pct_chg": pct,
+            "previous_board_count": _board_count(item, previous=True),
+            "industry": item.get("所属行业") or "",
+        }
+        if code in limit_codes or pct >= 9.8:
+            promoted.append(row)
+        else:
+            eliminated.append(row)
+        if code in broken_codes:
+            broken_from_previous.append(row)
+        if pct <= -5:
+            killed.append(row)
+    previous_count = len({_limit_code(item) for item in previous_items if _limit_code(item)})
+    promoted_count = len({x["ts_code"] for x in promoted})
+    broken_count = len({x["ts_code"] for x in broken_from_previous})
+    killed_count = len({x["ts_code"] for x in killed})
+    return {
+        "board_quality_top": qualities[:30],
+        "board_stage_counts": stage_counts,
+        "broken_rate": round((len(broken_items) / (len(limit_items) + len(broken_items)) * 100) if (limit_items or broken_items) else 0, 2),
+        "promotion": {
+            "previous_limit_up_count": previous_count,
+            "promoted_count": promoted_count,
+            "promoted_rate": round((promoted_count / previous_count * 100) if previous_count else 0, 2),
+            "broken_from_previous_count": broken_count,
+            "broken_from_previous_rate": round((broken_count / previous_count * 100) if previous_count else 0, 2),
+            "killed_count": killed_count,
+            "killed_rate": round((killed_count / previous_count * 100) if previous_count else 0, 2),
+            "promoted": promoted[:20],
+            "eliminated": eliminated[:20],
+            "killed": killed[:20],
+            "broken_from_previous": broken_from_previous[:20],
+        },
+    }
 
 
 def _source_error(name: str, exc: Exception) -> dict:
@@ -153,11 +318,13 @@ def collect_limit_up_snapshot(trade_date: str) -> tuple[dict, list[dict]]:
             result[key] = {
                 "count": int(len(df)),
                 "top": _safe_records(df, 12, sort_by=sort_by, reverse=True),
+                "items": _safe_records(df, 500, sort_by=sort_by, reverse=True),
             }
             status.append(_source_ok(func_name, len(df)))
         except Exception as exc:
             result[key] = {"count": 0, "top": [], "error": str(exc)}
             status.append(_source_error(func_name, exc))
+    result["analytics"] = _limit_pool_analytics(result)
     return result, status
 
 
@@ -571,6 +738,8 @@ def _fallback_structured(snapshot: dict) -> dict:
         "hot_sectors": hot,
         "risk_sectors": weak,
         "limit_up_summary": _format_limit_summary(snapshot.get("limit_up", {})),
+        "limit_board_quality": _format_limit_quality_summary(snapshot.get("limit_up", {})),
+        "limit_promotion_signal": _format_limit_promotion_summary(snapshot.get("limit_up", {})),
         "lhb_summary": _format_lhb_summary(snapshot.get("lhb", {})),
         "institution_signal": "机构席位数据见龙虎榜摘要。",
         "policy_signal": (snapshot.get("policy", {}) or {}).get("summary", "暂无政策信号摘要。"),
@@ -582,11 +751,40 @@ def _fallback_structured(snapshot: dict) -> dict:
 
 
 def _format_limit_summary(limit_up: dict) -> str:
+    analytics = limit_up.get("analytics") or {}
+    promotion = analytics.get("promotion") or {}
+    stages = analytics.get("board_stage_counts") or {}
     return (
         f"涨停{limit_up.get('limit_up_pool', {}).get('count', 0)}家，"
         f"强势池{limit_up.get('strong_pool', {}).get('count', 0)}家，"
         f"炸板{limit_up.get('broken_limit_up_pool', {}).get('count', 0)}家，"
         f"跌停{limit_up.get('limit_down_pool', {}).get('count', 0)}家。"
+        f"结构: 首板{stages.get('首板', 0)}、二板{stages.get('二板', 0)}、三板{stages.get('三板', 0)}、高位{stages.get('高位连板', 0)}。"
+        f"昨日涨停晋级率{promotion.get('promoted_rate', 0)}%，炸板率{analytics.get('broken_rate', 0)}%，闷杀率{promotion.get('killed_rate', 0)}%。"
+    )
+
+
+def _format_limit_quality_summary(limit_up: dict) -> str:
+    analytics = limit_up.get("analytics") or {}
+    top = analytics.get("board_quality_top") or []
+    if not top:
+        return "暂无可用涨停板质量数据。"
+    return "、".join(
+        f"{x.get('name')}({x.get('board_stage')},评分{x.get('quality_score')},炸板{x.get('broken_count')})"
+        for x in top[:8]
+    )
+
+
+def _format_limit_promotion_summary(limit_up: dict) -> str:
+    analytics = limit_up.get("analytics") or {}
+    promotion = analytics.get("promotion") or {}
+    if not promotion:
+        return "暂无晋级/淘汰统计。"
+    return (
+        f"昨日涨停{promotion.get('previous_limit_up_count', 0)}只，"
+        f"晋级{promotion.get('promoted_count', 0)}只({promotion.get('promoted_rate', 0)}%)，"
+        f"炸板{promotion.get('broken_from_previous_count', 0)}只({promotion.get('broken_from_previous_rate', 0)}%)，"
+        f"闷杀{promotion.get('killed_count', 0)}只({promotion.get('killed_rate', 0)}%)。"
     )
 
 
@@ -607,6 +805,13 @@ def _build_markdown(trade_date: str, structured: dict, snapshot: dict, data_stat
     warnings = "\n".join(f"- {x}" for x in (structured.get("risk_warnings") or [])) or "- 暂无"
     leaders = snapshot.get("market", {}).get("breadth", {}).get("leaders", [])[:8]
     leader_text = "、".join(f"{x.get('name')}({x.get('pct_chg')}%)" for x in leaders) or "暂无"
+    limit_analytics = snapshot.get("limit_up", {}).get("analytics", {})
+    quality_top = limit_analytics.get("board_quality_top") or []
+    quality_text = "、".join(
+        f"{x.get('name')}({x.get('board_stage')}/{x.get('quality_score')})"
+        for x in quality_top[:8]
+    ) or "暂无"
+    promotion = limit_analytics.get("promotion") or {}
     return f"""# 每日宏观市场报告 {trade_date}
 
 ## 市场状态
@@ -620,6 +825,8 @@ def _build_markdown(trade_date: str, structured: dict, snapshot: dict, data_stat
 ## 情绪与资金
 
 - 涨停/炸板/跌停: {structured.get("limit_up_summary", "")}
+- 板质量Top: {quality_text}
+- 晋级/淘汰: 昨日涨停{promotion.get('previous_limit_up_count', 0)}只，晋级{promotion.get('promoted_count', 0)}只({promotion.get('promoted_rate', 0)}%)，炸板{promotion.get('broken_from_previous_count', 0)}只，闷杀{promotion.get('killed_count', 0)}只。
 - 龙虎榜: {structured.get("lhb_summary", "")}
 - 机构席位: {structured.get("institution_signal", "")}
 
@@ -836,7 +1043,10 @@ def format_chip_distribution(ts_code: str) -> str:
 def format_macro_topic(topic: str = "report", trade_date: str = "") -> str:
     effective_date = resolve_trade_date(trade_date)
     raw = (topic or "report").lower()
-    row = get_macro_report_row(effective_date)
+    try:
+        row = get_macro_report_row(effective_date)
+    except Exception:
+        row = None
     snapshot = {}
     if row and row.get("raw_json"):
         try:
@@ -873,6 +1083,41 @@ def format_macro_topic(topic: str = "report", trade_date: str = "") -> str:
                 net = item.get("净额") or item.get("成交额") or item.get("累积买入额") or ""
                 reason = item.get("指标") or item.get("类型") or ""
                 lines.append(f"- {code} {name} {net} {reason}".strip())
+        return "\n".join(lines)
+    if raw in {"limit_quality", "board_quality", "涨停质量", "板质量", "封板质量"}:
+        limit_up = snapshot.get("limit_up") if snapshot else collect_limit_up_snapshot(effective_date)[0]
+        analytics = limit_up.get("analytics") or _limit_pool_analytics(limit_up)
+        lines = [f"{effective_date} 涨停板质量", _format_limit_summary(limit_up)]
+        lines.append("质量Top:")
+        for item in (analytics.get("board_quality_top") or [])[:20]:
+            seal = item.get("seal_amount") or 0
+            lines.append(
+                f"- {item.get('ts_code')} {item.get('name')} {item.get('board_stage')} "
+                f"评分{item.get('quality_score')} 首封{item.get('first_seal_time') or '-'} "
+                f"末封{item.get('last_seal_time') or '-'} 炸板{item.get('broken_count')} "
+                f"封单/封板资金{float(seal):.0f} 行业{item.get('industry') or ''}"
+            )
+        return "\n".join(lines)
+    if raw in {"promotion", "advance", "晋级率", "涨停晋级", "晋级淘汰"}:
+        limit_up = snapshot.get("limit_up") if snapshot else collect_limit_up_snapshot(effective_date)[0]
+        analytics = limit_up.get("analytics") or _limit_pool_analytics(limit_up)
+        promotion = analytics.get("promotion") or {}
+        lines = [
+            f"{effective_date} 涨停晋级/淘汰",
+            f"昨日涨停{promotion.get('previous_limit_up_count', 0)}只，"
+            f"晋级{promotion.get('promoted_count', 0)}只({promotion.get('promoted_rate', 0)}%)，"
+            f"炸板{promotion.get('broken_from_previous_count', 0)}只({promotion.get('broken_from_previous_rate', 0)}%)，"
+            f"闷杀{promotion.get('killed_count', 0)}只({promotion.get('killed_rate', 0)}%)。",
+            f"当日炸板率: {analytics.get('broken_rate', 0)}%",
+        ]
+        if promotion.get("promoted"):
+            lines.append("晋级标的:")
+            for item in promotion["promoted"][:12]:
+                lines.append(f"- {item.get('ts_code')} {item.get('name')} 昨{item.get('previous_board_count')}板 今日{item.get('pct_chg')}% {item.get('industry') or ''}")
+        if promotion.get("killed"):
+            lines.append("闷杀/退潮样本:")
+            for item in promotion["killed"][:10]:
+                lines.append(f"- {item.get('ts_code')} {item.get('name')} {item.get('pct_chg')}% 昨{item.get('previous_board_count')}板 {item.get('industry') or ''}")
         return "\n".join(lines)
     limit_map = {
         "limit_up": ("limit_up_pool", "涨停板"),

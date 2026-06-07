@@ -875,6 +875,20 @@ def get_macro_market_topic(topic: str = "report", trade_date: str = "") -> str:
 
 
 @tool
+def get_limit_up_board_quality(trade_date: str = "") -> str:
+    """读取涨停板质量摘要，直接基于 AkShare 涨停池的封板资金、封板时间、炸板次数和连板数。"""
+    from backend.macro.report import format_macro_topic
+    return format_macro_topic("limit_quality", trade_date)
+
+
+@tool
+def get_limit_up_promotion_stats(trade_date: str = "") -> str:
+    """读取昨日涨停到今日的晋级/炸板/闷杀统计，用于判断短线情绪周期。"""
+    from backend.macro.report import format_macro_topic
+    return format_macro_topic("promotion", trade_date)
+
+
+@tool
 def get_stock_chip_distribution(ts_code: str) -> str:
     """模拟个股前复权筹码分布。
 
@@ -1315,6 +1329,8 @@ AGENT_TOOLS = [
     get_global_position_exposure,
     get_macro_daily_report,
     get_macro_market_topic,
+    get_limit_up_board_quality,
+    get_limit_up_promotion_stats,
     get_stock_chip_distribution,
     get_policy_signals,
     get_agent_performance,
@@ -1352,6 +1368,8 @@ _TOOL_CATEGORIES = {
     "get_global_position_exposure": "多Agent协作",
     "get_macro_daily_report": "行情",
     "get_macro_market_topic": "行情",
+    "get_limit_up_board_quality": "行情",
+    "get_limit_up_promotion_stats": "行情",
     "get_stock_chip_distribution": "行情",
     "get_policy_signals": "政策",
     "get_company_business": "基本面",
@@ -1382,6 +1400,8 @@ _MANDATORY_TOOL_NAMES = {
     "get_sector_temperature",
     "get_macro_daily_report",
     "get_macro_market_topic",
+    "get_limit_up_board_quality",
+    "get_limit_up_promotion_stats",
     "get_strategy_param_schema",
     "get_agent_stock_pool",
     "get_agent_signal_committee",

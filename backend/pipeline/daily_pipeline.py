@@ -1356,6 +1356,7 @@ def run_daily_pipeline(trade_date: str = None, agent_ids: list[int] | None = Non
                         "open": row["open"], "high": row["high"],
                         "low": row["low"], "close": row["close"],
                         "pct_chg": row.get("pct_chg", 0),
+                        "is_st": row.get("is_st", 0),
                     }
 
         conn.commit()
@@ -1809,6 +1810,7 @@ def simulate_day(trade_date: str):
                         "open": row["open"], "high": row["high"],
                         "low": row["low"], "close": row["close"],
                         "pct_chg": row.get("pct_chg", 0),
+                        "is_st": row.get("is_st", 0),
                     }
         trades = execute_orders(agent_id, trade_date, price_data)
         results[agent["display_name"]] = {"trades": len(trades)}

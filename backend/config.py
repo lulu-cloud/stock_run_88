@@ -31,6 +31,11 @@ DAILY_DIR = os.path.join(DATA_DIR, "daily")
 INDEX_DIR = os.path.join(DATA_DIR, "index")
 COMPANY_BUSINESS_DIR = os.path.join(DATA_DIR, "company_business")
 
+# 日线行情口径：baostock adjustflag=2，即前复权。策略、回测、模拟、
+# 筹码分布和 Agent 挂单校验默认均基于这一价格口径。
+DAILY_PRICE_ADJUSTMENT = "qfq"
+BAOSTOCK_ADJUSTFLAG_DAILY = "2"
+
 # 日志和报告
 LOGS_DIR = os.path.join(ROOT_DIR, "logs")
 REPORTS_DIR = os.path.join(ROOT_DIR, "reports")
