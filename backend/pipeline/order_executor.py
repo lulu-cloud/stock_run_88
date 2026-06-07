@@ -46,6 +46,9 @@ def execute_orders(agent_id: int, trade_date: str,
         return float(row["current_cash"] or 0) if row else 0.0
 
     for order in orders:
+        current_status = conn.execute("SELECT status FROM agent_order WHERE id=?", (order["id"],)).fetchone()
+        if current_status and current_status["status"] != "pending":
+            continue
         ts_code = order["ts_code"]
         if ts_code not in price_data:
             _expire_order(order, "缺少当日行情数据", conn)
@@ -66,12 +69,30 @@ def execute_orders(agent_id: int, trade_date: str,
             cash = refresh_cash()
             continue
 
-        # 撮合检查
+        # 条件单/限价单撮合检查
         matched, exec_price, match_reason = _match_order(order, open_p, low_p, high_p)
         if not matched:
             _expire_order(order, match_reason, conn)
             cash = refresh_cash()
             continue
+        if order.get("order_type") in ("stop_loss", "stop_profit", "condition"):
+            conn.execute(
+                "UPDATE agent_order SET status='triggered', triggered_at=datetime('now') WHERE id=?",
+                (order["id"],),
+            )
+            record_order_trace(
+                conn,
+                order["id"],
+                "triggered",
+                match_reason,
+                status_from="pending",
+                status_to="triggered",
+                payload={
+                    "order_type": order.get("order_type"),
+                    "trigger_price": order.get("trigger_price"),
+                    "condition_expr": order.get("condition_expr") or "",
+                },
+            )
         record_order_trace(
             conn,
             order["id"],
@@ -200,6 +221,7 @@ def execute_orders(agent_id: int, trade_date: str,
             event_type="filled",
             payload={"exec_price": exec_price, "total_value": total_value},
         )
+        _cancel_oco_siblings(order, conn)
         trades.append(trade_row)
 
     conn.commit()
@@ -210,6 +232,32 @@ def execute_orders(agent_id: int, trade_date: str,
 def _match_order(order: dict, open_p: float, low_p: float, high_p: float) -> tuple[bool, float, str]:
     order_price = float(order["price"] or 0)
     direction = order.get("direction")
+    order_type = str(order.get("order_type") or "limit")
+    trigger_price = float(order.get("trigger_price") or order_price or 0)
+    if order_type in ("stop_loss", "stop_profit", "condition"):
+        triggered = False
+        exec_price = trigger_price
+        if order_type == "stop_loss":
+            if direction == "sell":
+                triggered = low_p <= trigger_price
+                exec_price = open_p if open_p <= trigger_price else trigger_price
+            else:
+                triggered = high_p >= trigger_price
+                exec_price = open_p if open_p >= trigger_price else trigger_price
+        elif order_type == "stop_profit":
+            if direction == "sell":
+                triggered = high_p >= trigger_price
+                exec_price = open_p if open_p >= trigger_price else trigger_price
+            else:
+                triggered = low_p <= trigger_price
+                exec_price = open_p if open_p <= trigger_price else trigger_price
+        else:
+            triggered = low_p <= trigger_price <= high_p
+            exec_price = trigger_price
+        if triggered:
+            return True, round(float(exec_price), 2), f"{order_type} 触发价{trigger_price:.2f}成交"
+        return False, 0.0, f"{order_type} 触发价{trigger_price:.2f}未触发，当日区间{low_p:.2f}-{high_p:.2f}"
+
     if int(order.get("open_get_in") or 0):
         if direction == "buy" and open_p <= order_price:
             return True, open_p, "open_get_in 开盘买入成交"
@@ -218,7 +266,41 @@ def _match_order(order: dict, open_p: float, low_p: float, high_p: float) -> tup
     matched, exec_price = match_order_price(order_price, low_p, high_p)
     if matched:
         return True, exec_price, "限价触达成交"
+    if int(order.get("chase_enabled") or 0):
+        chase_pct = max(0.0, float(order.get("chase_pct") or 0.0))
+        if chase_pct > 0:
+            chase_price = order_price * (1 + chase_pct / 100) if direction == "buy" else order_price * (1 - chase_pct / 100)
+            chase_price = round(chase_price, 2)
+            matched, exec_price = match_order_price(chase_price, low_p, high_p)
+            if matched:
+                return True, exec_price, f"原限价{order_price:.2f}未触达，追价{chase_price:.2f}触达成交"
     return False, 0.0, f"限价{order_price:.2f}未触达，当日区间{low_p:.2f}-{high_p:.2f}"
+
+
+def _cancel_oco_siblings(order: dict, conn: sqlite3.Connection):
+    group = str(order.get("oco_group") or "").strip()
+    if not group:
+        return
+    rows = conn.execute(
+        """SELECT * FROM agent_order
+           WHERE agent_id=? AND oco_group=? AND id<>? AND status='pending'""",
+        (order["agent_id"], group, order["id"]),
+    ).fetchall()
+    for row in rows:
+        reserved_cash = float(row["reserved_cash"] or 0)
+        if row["direction"] == "buy" and reserved_cash > 0:
+            agent = conn.execute("SELECT current_cash FROM agent_info WHERE id=?", (row["agent_id"],)).fetchone()
+            if agent:
+                update_agent_cash(row["agent_id"], float(agent["current_cash"] or 0) + reserved_cash, conn)
+            conn.execute("UPDATE agent_order SET reserved_cash=0 WHERE id=?", (row["id"],))
+        update_order_status(
+            row["id"],
+            "cancelled",
+            conn,
+            "OCO同组订单已成交，自动取消",
+            event_type="oco_cancelled",
+            payload={"oco_group": group, "filled_order_id": order["id"]},
+        )
 
 
 def _expire_order(order: dict, reason: str, conn: sqlite3.Connection):

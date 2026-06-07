@@ -82,8 +82,18 @@ CREATE TABLE IF NOT EXISTS agent_order (
     order_type  TEXT DEFAULT 'limit' CHECK(order_type IN ('limit', 'stop_loss', 'stop_profit', 'condition')),
     quantity    INTEGER NOT NULL,
     price       REAL NOT NULL,
+    trigger_price REAL,
+    condition_expr TEXT,
     open_get_in INTEGER DEFAULT 0,
     reserved_cash REAL DEFAULT 0.0,
+    parent_order_id INTEGER,
+    oco_group   TEXT,
+    chase_enabled INTEGER DEFAULT 0,
+    chase_pct   REAL DEFAULT 0.0,
+    split_group TEXT,
+    split_seq   INTEGER DEFAULT 1,
+    split_total INTEGER DEFAULT 1,
+    risk_control INTEGER DEFAULT 0,
     decision_batch_id TEXT,
     fill_probability REAL,
     price_aggressiveness REAL,
@@ -759,6 +769,16 @@ def _migrate_existing_schema(conn: sqlite3.Connection):
     _add_column_if_missing(conn, "agent_daily_report", "risk_adjust_log", "risk_adjust_log TEXT")
     _add_column_if_missing(conn, "agent_order", "open_get_in", "open_get_in INTEGER DEFAULT 0")
     _add_column_if_missing(conn, "agent_order", "reserved_cash", "reserved_cash REAL DEFAULT 0.0")
+    _add_column_if_missing(conn, "agent_order", "trigger_price", "trigger_price REAL")
+    _add_column_if_missing(conn, "agent_order", "condition_expr", "condition_expr TEXT")
+    _add_column_if_missing(conn, "agent_order", "parent_order_id", "parent_order_id INTEGER")
+    _add_column_if_missing(conn, "agent_order", "oco_group", "oco_group TEXT")
+    _add_column_if_missing(conn, "agent_order", "chase_enabled", "chase_enabled INTEGER DEFAULT 0")
+    _add_column_if_missing(conn, "agent_order", "chase_pct", "chase_pct REAL DEFAULT 0.0")
+    _add_column_if_missing(conn, "agent_order", "split_group", "split_group TEXT")
+    _add_column_if_missing(conn, "agent_order", "split_seq", "split_seq INTEGER DEFAULT 1")
+    _add_column_if_missing(conn, "agent_order", "split_total", "split_total INTEGER DEFAULT 1")
+    _add_column_if_missing(conn, "agent_order", "risk_control", "risk_control INTEGER DEFAULT 0")
     _add_column_if_missing(conn, "agent_order", "decision_batch_id", "decision_batch_id TEXT")
     _add_column_if_missing(conn, "agent_order", "fill_probability", "fill_probability REAL")
     _add_column_if_missing(conn, "agent_order", "price_aggressiveness", "price_aggressiveness REAL")

@@ -607,13 +607,21 @@ def rollback_agent_state(agent_id: int, snapshot: dict):
     for o in snapshot.get("orders", []):
         conn.execute(
             """INSERT INTO agent_order (id, agent_id, ts_code, stock_name, direction, order_type,
-               quantity, price, open_get_in, reserved_cash, skill_id, skill_confidence,
+               quantity, price, trigger_price, condition_expr, open_get_in, reserved_cash,
+               parent_order_id, oco_group, chase_enabled, chase_pct,
+               split_group, split_seq, split_total, risk_control,
+               decision_batch_id, fill_probability, price_aggressiveness, skill_id, skill_confidence,
                failure_attribution, evolution_mark, reason, fail_reason, status, trade_date,
                created_at, triggered_at, filled_at, expired_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (o["id"], agent_id, o["ts_code"], o.get("stock_name", ""), o["direction"],
              o.get("order_type", "limit"), o["quantity"], o.get("price", 0),
-             o.get("open_get_in", 0), o.get("reserved_cash", 0), o.get("skill_id", ""),
+             o.get("trigger_price"), o.get("condition_expr", ""), o.get("open_get_in", 0),
+             o.get("reserved_cash", 0), o.get("parent_order_id"), o.get("oco_group", ""),
+             o.get("chase_enabled", 0), o.get("chase_pct", 0), o.get("split_group", ""),
+             o.get("split_seq", 1), o.get("split_total", 1), o.get("risk_control", 0),
+             o.get("decision_batch_id", ""), o.get("fill_probability"), o.get("price_aggressiveness"),
+             o.get("skill_id", ""),
              o.get("skill_confidence", 0), o.get("failure_attribution", ""),
              o.get("evolution_mark", ""), o.get("reason", ""), o.get("fail_reason", ""),
              o.get("status", "pending"), o.get("trade_date", ""), o.get("created_at"),
@@ -729,7 +737,9 @@ def _reserved_cash(agent_id: int, conn: sqlite3.Connection) -> float:
 
 def _recent_orders(agent_id: int, trade_date: str, conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
     rows = conn.execute(
-        """SELECT id, ts_code, stock_name, direction, quantity, price, open_get_in, reserved_cash,
+        """SELECT id, ts_code, stock_name, direction, order_type, quantity, price, open_get_in, reserved_cash,
+                  trigger_price, condition_expr, parent_order_id, oco_group, chase_enabled, chase_pct,
+                  split_group, split_seq, split_total, risk_control,
                   decision_batch_id, fill_probability, price_aggressiveness,
                   skill_id, skill_confidence, failure_attribution, evolution_mark,
                   reason, status, trade_date, fail_reason, created_at, filled_at, expired_at
@@ -835,6 +845,289 @@ def _reserve_order_cash(agent_id: int, order_data: dict, conn: sqlite3.Connectio
         (cash - reserve, agent_id),
     )
     return True, reserve, ""
+
+
+def _bool_value(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on", "是"}
+
+
+def _expand_split_orders(order_data: dict) -> list[dict]:
+    split_total = max(1, min(10, int(order_data.get("split_total") or 1)))
+    quantity = int(order_data.get("quantity") or 0)
+    if split_total <= 1 or quantity < 200:
+        item = dict(order_data)
+        item["split_total"] = 1
+        item["split_seq"] = 1
+        return [item]
+    lot_count = quantity // 100
+    split_total = min(split_total, lot_count)
+    base_lots = lot_count // split_total
+    extra = lot_count % split_total
+    split_group = order_data.get("split_group") or f"split-{int(time.time() * 1000)}"
+    rows = []
+    for seq in range(1, split_total + 1):
+        lots = base_lots + (1 if seq <= extra else 0)
+        if lots <= 0:
+            continue
+        item = dict(order_data)
+        item["quantity"] = lots * 100
+        item["split_group"] = split_group
+        item["split_seq"] = seq
+        item["split_total"] = split_total
+        rows.append(item)
+    return rows or [dict(order_data)]
+
+
+def _latest_position_price(pos: dict, trade_date: str) -> float:
+    current = float(pos.get("current_price") or 0)
+    if current > 0:
+        return current
+    df = load_daily(pos.get("ts_code", ""))
+    if df is None or df.empty:
+        return float(pos.get("avg_cost") or 0)
+    latest = df[df["trade_date"] <= trade_date]
+    if latest.empty:
+        latest = df
+    return float(latest.iloc[-1]["close"] or pos.get("avg_cost") or 0)
+
+
+def _position_holding_days(pos: dict, trade_date: str) -> int:
+    buy_date = str(pos.get("buy_date") or "")
+    if not buy_date:
+        return 0
+    try:
+        start = datetime.strptime(buy_date, "%Y%m%d").date()
+        end = datetime.strptime(str(trade_date), "%Y%m%d").date()
+        return max(0, (end - start).days)
+    except Exception:
+        return 0
+
+
+def _previous_total_assets(agent_id: int, trade_date: str, initial_capital: float, conn: sqlite3.Connection) -> float:
+    row = conn.execute(
+        """SELECT total_assets FROM agent_daily_report
+           WHERE agent_id=? AND trade_date<? ORDER BY trade_date DESC LIMIT 1""",
+        (agent_id, trade_date),
+    ).fetchone()
+    return float(row["total_assets"] if row else initial_capital)
+
+
+def _risk_control_orders(
+    agent_id: int,
+    agent_name: str,
+    trade_date: str,
+    next_order_date: str,
+    risk_cfg: dict,
+    positions: list[dict],
+    total_assets: float,
+    initial_capital: float,
+    conn: sqlite3.Connection,
+) -> tuple[list[dict], dict]:
+    """Create protective sell orders from hard risk rules."""
+    max_daily_loss = float(risk_cfg.get("max_daily_loss") or 0)
+    max_holding_days = int(risk_cfg.get("max_holding_days") or risk_cfg.get("max_position_days") or 0)
+    stop_loss_pct = abs(float(risk_cfg.get("stop_loss_pct") or 0))
+    stop_profit_pct = abs(float(risk_cfg.get("stop_profit_pct") or 0))
+    prev_assets = _previous_total_assets(agent_id, trade_date, initial_capital, conn)
+    daily_return = ((total_assets - prev_assets) / prev_assets) if prev_assets else 0.0
+    circuit = bool(max_daily_loss > 0 and daily_return <= -max_daily_loss)
+    orders: list[dict] = []
+    meta = {
+        "daily_return": round(daily_return * 100, 4),
+        "max_daily_loss_pct": round(max_daily_loss * 100, 4),
+        "circuit_breaker": circuit,
+        "max_holding_days": max_holding_days,
+    }
+    existing = conn.execute(
+        """SELECT ts_code, direction, order_type, oco_group, risk_control FROM agent_order
+           WHERE agent_id=? AND trade_date=? AND status='pending'""",
+        (agent_id, next_order_date),
+    ).fetchall()
+    existing_keys = {
+        (r["ts_code"], r["order_type"], r["oco_group"] or "", int(r["risk_control"] or 0))
+        for r in existing
+    }
+    existing_sell_codes = {r["ts_code"] for r in existing if r["direction"] == "sell"}
+    for pos in positions:
+        qty = int(pos.get("available_shares") or pos.get("quantity") or 0)
+        if qty <= 0:
+            continue
+        price = _latest_position_price(pos, trade_date)
+        if price <= 0:
+            continue
+        holding_days = _position_holding_days(pos, trade_date)
+        reasons = []
+        if circuit:
+            reasons.append(f"日内亏损{daily_return*100:.2f}%触发熔断阈值{max_daily_loss*100:.2f}%")
+        if max_holding_days > 0 and holding_days >= max_holding_days:
+            reasons.append(f"持仓{holding_days}天达到最大持仓天数{max_holding_days}")
+        if not reasons:
+            continue
+        key = (pos["ts_code"], "limit", "", 1)
+        if key in existing_keys or pos["ts_code"] in existing_sell_codes:
+            continue
+        sell_price = round(price * 0.98, 2)
+        orders.append({
+            "ts_code": pos["ts_code"],
+            "stock_name": pos.get("stock_name") or "",
+            "direction": "sell",
+            "order_type": "limit",
+            "quantity": qty // 100 * 100,
+            "price": sell_price,
+            "open_get_in": True,
+            "risk_control": True,
+            "trade_date": next_order_date,
+            "reason": "；".join(reasons) + "，系统生成保护性卖单。",
+            "evolution_mark": "#risk_control#",
+        })
+    if stop_loss_pct > 0 or stop_profit_pct > 0:
+        for pos in positions:
+            qty = int(pos.get("available_shares") or pos.get("quantity") or 0)
+            avg_cost = float(pos.get("avg_cost") or 0)
+            if qty <= 0 or avg_cost <= 0:
+                continue
+            group = f"risk-oco-{agent_id}-{pos['ts_code']}-{next_order_date}"
+            if stop_loss_pct > 0:
+                trigger = round(avg_cost * (1 - stop_loss_pct / 100), 2)
+                key = (pos["ts_code"], "stop_loss", group, 1)
+                if key not in existing_keys:
+                    orders.append({
+                        "ts_code": pos["ts_code"],
+                        "stock_name": pos.get("stock_name") or "",
+                        "direction": "sell",
+                        "order_type": "stop_loss",
+                        "quantity": qty // 100 * 100,
+                        "price": trigger,
+                        "trigger_price": trigger,
+                        "oco_group": group,
+                        "risk_control": True,
+                        "trade_date": next_order_date,
+                        "reason": f"系统风险单：成本{avg_cost:.2f}，止损{stop_loss_pct:.2f}%触发价{trigger:.2f}。",
+                        "evolution_mark": "#stop_loss#",
+                    })
+            if stop_profit_pct > 0:
+                trigger = round(avg_cost * (1 + stop_profit_pct / 100), 2)
+                key = (pos["ts_code"], "stop_profit", group, 1)
+                if key not in existing_keys:
+                    orders.append({
+                        "ts_code": pos["ts_code"],
+                        "stock_name": pos.get("stock_name") or "",
+                        "direction": "sell",
+                        "order_type": "stop_profit",
+                        "quantity": qty // 100 * 100,
+                        "price": trigger,
+                        "trigger_price": trigger,
+                        "oco_group": group,
+                        "risk_control": True,
+                        "trade_date": next_order_date,
+                        "reason": f"系统风险单：成本{avg_cost:.2f}，止盈{stop_profit_pct:.2f}%触发价{trigger:.2f}。",
+                        "evolution_mark": "#stop_profit#",
+                    })
+    return [o for o in orders if int(o.get("quantity") or 0) >= 100], meta
+
+
+def _insert_planned_orders(
+    conn: sqlite3.Connection,
+    agent_id: int,
+    agent_name: str,
+    orders: list[dict],
+    trade_date: str,
+    decision_batch_id: str,
+    source: str,
+    stock_pool_policy: dict | None = None,
+) -> int:
+    inserted_order_count = 0
+    for original in orders:
+        for order_data in _expand_split_orders(original):
+            order_data["trade_date"] = trade_date
+            if stock_pool_policy is not None:
+                pool_ok, pool_meta = _stock_pool_order_policy(order_data, stock_pool_policy)
+                if not pool_ok:
+                    print(
+                        f"Agent {agent_name} order skipped: {order_data.get('ts_code')} "
+                        f"{pool_meta.get('out_of_pool_reason')}"
+                    )
+                    continue
+            else:
+                pool_meta = {}
+            ok, reserved, fail_reason = _reserve_order_cash(agent_id, order_data, conn)
+            if not ok:
+                print(f"Agent {agent_name} order skipped: {fail_reason}")
+                continue
+            cur = conn.execute(
+                """INSERT INTO agent_order (agent_id, ts_code, stock_name, direction, order_type,
+                   quantity, price, trigger_price, condition_expr, open_get_in, reserved_cash,
+                   parent_order_id, oco_group, chase_enabled, chase_pct,
+                   split_group, split_seq, split_total, risk_control,
+                   decision_batch_id, fill_probability, price_aggressiveness, skill_id,
+                   skill_confidence, evolution_mark, reason, trade_date)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (agent_id, order_data.get("ts_code", ""),
+                 order_data.get("stock_name", ""),
+                 order_data.get("direction", "buy"),
+                 order_data.get("order_type", "limit"),
+                 order_data.get("quantity", 100),
+                 order_data.get("price", 0.0),
+                 order_data.get("trigger_price") or None,
+                 order_data.get("condition_expr", ""),
+                 1 if _bool_value(order_data.get("open_get_in")) else 0,
+                 reserved,
+                 order_data.get("parent_order_id"),
+                 order_data.get("oco_group", ""),
+                 1 if _bool_value(order_data.get("chase_enabled")) else 0,
+                 float(order_data.get("chase_pct") or 0),
+                 order_data.get("split_group", ""),
+                 int(order_data.get("split_seq") or 1),
+                 int(order_data.get("split_total") or 1),
+                 1 if _bool_value(order_data.get("risk_control")) else 0,
+                 order_data.get("decision_batch_id") or decision_batch_id,
+                 order_data.get("fill_probability"),
+                 order_data.get("price_aggressiveness"),
+                 order_data.get("skill_id", ""),
+                 float(order_data.get("skill_confidence") or 0),
+                 order_data.get("evolution_mark", ""),
+                 order_data.get("reason", ""),
+                 trade_date),
+            )
+            record_order_trace(
+                conn,
+                cur.lastrowid,
+                "created",
+                order_data.get("reason", ""),
+                status_from="",
+                status_to="pending",
+                payload={
+                    "source": source,
+                    "decision_batch_id": decision_batch_id,
+                    "direction": order_data.get("direction", "buy"),
+                    "quantity": order_data.get("quantity", 100),
+                    "price": order_data.get("price", 0.0),
+                    "trigger_price": order_data.get("trigger_price") or None,
+                    "condition_expr": order_data.get("condition_expr", ""),
+                    "order_type": order_data.get("order_type", "limit"),
+                    "open_get_in": bool(_bool_value(order_data.get("open_get_in"))),
+                    "oco_group": order_data.get("oco_group", ""),
+                    "chase_enabled": bool(_bool_value(order_data.get("chase_enabled"))),
+                    "chase_pct": float(order_data.get("chase_pct") or 0),
+                    "split_group": order_data.get("split_group", ""),
+                    "split_seq": int(order_data.get("split_seq") or 1),
+                    "split_total": int(order_data.get("split_total") or 1),
+                    "risk_control": bool(_bool_value(order_data.get("risk_control"))),
+                    "fill_probability": order_data.get("fill_probability"),
+                    "price_aggressiveness": order_data.get("price_aggressiveness"),
+                    "fill_estimate_sample_size": order_data.get("fill_estimate_sample_size"),
+                    "skill_id": order_data.get("skill_id", ""),
+                    **pool_meta,
+                },
+            )
+            inserted_order_count += 1
+    if inserted_order_count:
+        refresh_decision_batch_status(conn, decision_batch_id)
+    return inserted_order_count
 
 
 def _estimate_order_execution(order_data: dict, asof_trade_date: str, lookback: int = 60) -> dict:
@@ -1091,6 +1384,7 @@ def run_daily_pipeline(trade_date: str = None, agent_ids: list[int] | None = Non
         conn.commit()
 
         thinking_log_path = f"logs/{trade_date}/{agent['name']}/thinking.log"
+        risk_cfg = {}
         try:
             risk_cfg = json.loads(agent.get("risk_config", "{}"))
             reasoning_effort = risk_cfg.get("reasoning_effort", "high")
@@ -1173,67 +1467,17 @@ def run_daily_pipeline(trade_date: str = None, agent_ids: list[int] | None = Non
                     (decision.risk_assessment or decision.market_analysis or "")[:1200],
                 ),
             )
-            inserted_order_count = 0
             stock_pool_policy = _load_stock_pool_policy(agent_id, risk_cfg, conn)
-            for order_data in planned_orders:
-                order_data["trade_date"] = next_order_date
-                pool_ok, pool_meta = _stock_pool_order_policy(order_data, stock_pool_policy)
-                if not pool_ok:
-                    print(
-                        f"Agent {agent_name} order skipped: {order_data.get('ts_code')} "
-                        f"{pool_meta.get('out_of_pool_reason')}"
-                    )
-                    continue
-                ok, reserved, fail_reason = _reserve_order_cash(agent_id, order_data, conn)
-                if not ok:
-                    print(f"Agent {agent_name} order skipped: {fail_reason}")
-                    continue
-                cur = conn.execute(
-                    """INSERT INTO agent_order (agent_id, ts_code, stock_name, direction, order_type,
-                       quantity, price, open_get_in, reserved_cash, decision_batch_id,
-                       fill_probability, price_aggressiveness, skill_id, skill_confidence,
-                       evolution_mark, reason, trade_date)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (agent_id, order_data.get("ts_code", ""),
-                     order_data.get("stock_name", ""),
-                     order_data.get("direction", "buy"),
-                     order_data.get("order_type", "limit"),
-                     order_data.get("quantity", 100),
-                     order_data.get("price", 0.0),
-                     1 if order_data.get("open_get_in") else 0,
-                     reserved,
-                     order_data.get("decision_batch_id", ""),
-                     order_data.get("fill_probability"),
-                     order_data.get("price_aggressiveness"),
-                     order_data.get("skill_id", ""),
-                     float(order_data.get("skill_confidence") or 0),
-                     order_data.get("evolution_mark", ""),
-                     order_data.get("reason", ""),
-                     next_order_date),
-                )
-                record_order_trace(
-                    conn,
-                    cur.lastrowid,
-                    "created",
-                    order_data.get("reason", ""),
-                    status_from="",
-                    status_to="pending",
-                    payload={
-                        "source": "daily_review",
-                        "decision_batch_id": decision_batch_id,
-                        "direction": order_data.get("direction", "buy"),
-                        "quantity": order_data.get("quantity", 100),
-                        "price": order_data.get("price", 0.0),
-                        "order_type": order_data.get("order_type", "limit"),
-                        "open_get_in": bool(order_data.get("open_get_in")),
-                        "fill_probability": order_data.get("fill_probability"),
-                        "price_aggressiveness": order_data.get("price_aggressiveness"),
-                        "fill_estimate_sample_size": order_data.get("fill_estimate_sample_size"),
-                        "skill_id": order_data.get("skill_id", ""),
-                        **pool_meta,
-                    },
-                )
-                inserted_order_count += 1
+            inserted_order_count = _insert_planned_orders(
+                conn,
+                agent_id,
+                agent_name,
+                planned_orders,
+                next_order_date,
+                decision_batch_id,
+                "daily_review",
+                stock_pool_policy,
+            )
             if inserted_order_count:
                 refresh_decision_batch_status(conn, decision_batch_id)
             else:
@@ -1241,6 +1485,48 @@ def run_daily_pipeline(trade_date: str = None, agent_ids: list[int] | None = Non
                     "UPDATE agent_decision_batch SET status='skipped', updated_at=datetime('now') WHERE id=?",
                     (decision_batch_id,),
                 )
+
+        risk_orders, risk_meta = _risk_control_orders(
+            agent_id,
+            agent_name,
+            trade_date,
+            next_order_date,
+            risk_cfg,
+            positions,
+            total_assets,
+            agent_after["initial_capital"],
+            conn,
+        )
+        if risk_orders:
+            risk_batch_id = f"risk-{agent_id}-{trade_date}-{int(time.time())}"
+            conn.execute(
+                """INSERT INTO agent_decision_batch
+                   (id, agent_id, trade_date, next_trade_date, order_count, buy_count, sell_count,
+                    avg_fill_probability, summary)
+                   VALUES (?, ?, ?, ?, ?, 0, ?, NULL, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                   order_count=excluded.order_count, sell_count=excluded.sell_count,
+                   summary=excluded.summary, updated_at=datetime('now')""",
+                (
+                    risk_batch_id,
+                    agent_id,
+                    trade_date,
+                    next_order_date,
+                    len(risk_orders),
+                    len(risk_orders),
+                    json.dumps(risk_meta, ensure_ascii=False),
+                ),
+            )
+            _insert_planned_orders(
+                conn,
+                agent_id,
+                agent_name,
+                risk_orders,
+                next_order_date,
+                risk_batch_id,
+                "system_risk_control",
+                None,
+            )
 
         agent_after_orders = conn.execute("SELECT * FROM agent_info WHERE id=?", (agent_id,)).fetchone()
         frozen_cash = _reserved_cash(agent_id, conn)

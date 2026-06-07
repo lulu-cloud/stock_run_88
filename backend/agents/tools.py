@@ -457,6 +457,72 @@ def validate_order_price_limit(ts_code: str, order_price: float, base_price: flo
 
 
 @tool
+def calculate_position_size(
+    agent_id: int,
+    ts_code: str,
+    entry_price: float,
+    stop_price: float = 0.0,
+    risk_budget_pct: float = 1.0,
+    max_position_pct: float = 15.0,
+) -> str:
+    """按风险预算估算建议下单股数。
+
+    Args:
+        agent_id: Agent ID
+        ts_code: 股票代码
+        entry_price: 计划买入价
+        stop_price: 止损价；为0时按 entry_price 下方 5% 估算
+        risk_budget_pct: 单笔最多亏损占总资产百分比，默认1%
+        max_position_pct: 单票最大仓位占总资产百分比，默认15%
+
+    Returns:
+        JSON，包含风险预算、止损距离、建议股数和实际仓位。
+    """
+    code = normalize_ts_code(ts_code)
+    entry = float(entry_price or 0)
+    if entry <= 0:
+        return json.dumps({"ok": False, "error": "entry_price 必须大于0"}, ensure_ascii=False)
+    stop = float(stop_price or 0) or entry * 0.95
+    risk_per_share = max(0.01, entry - stop)
+    conn = get_read_conn()
+    agent = conn.execute("SELECT current_cash, initial_capital FROM agent_info WHERE id=?", (agent_id,)).fetchone()
+    position_value = conn.execute(
+        "SELECT COALESCE(SUM(market_value), 0) FROM agent_position WHERE agent_id=?",
+        (agent_id,),
+    ).fetchone()[0]
+    frozen = conn.execute(
+        "SELECT COALESCE(SUM(reserved_cash), 0) FROM agent_order WHERE agent_id=? AND status='pending'",
+        (agent_id,),
+    ).fetchone()[0]
+    conn.close()
+    cash = float(agent["current_cash"] or 0) if agent else 0.0
+    total_assets = cash + float(position_value or 0) + float(frozen or 0)
+    risk_budget = total_assets * max(0.0, float(risk_budget_pct or 0)) / 100.0
+    max_position_value = total_assets * max(0.0, float(max_position_pct or 0)) / 100.0
+    by_risk = int(risk_budget // risk_per_share)
+    by_position = int(max_position_value // entry)
+    by_cash = int(cash // entry)
+    shares = max(0, min(by_risk, by_position, by_cash) // 100 * 100)
+    return json.dumps({
+        "ok": True,
+        "agent_id": agent_id,
+        "ts_code": code,
+        "entry_price": round(entry, 2),
+        "stop_price": round(stop, 2),
+        "risk_per_share": round(risk_per_share, 4),
+        "total_assets_est": round(total_assets, 2),
+        "cash": round(cash, 2),
+        "risk_budget_pct": risk_budget_pct,
+        "risk_budget_value": round(risk_budget, 2),
+        "max_position_pct": max_position_pct,
+        "max_position_value": round(max_position_value, 2),
+        "suggested_quantity": shares,
+        "suggested_value": round(shares * entry, 2),
+        "actual_position_pct": round((shares * entry / total_assets * 100) if total_assets else 0, 2),
+    }, ensure_ascii=False)
+
+
+@tool
 def get_recent_order_history(agent_id: int, days: int = 5) -> str:
     """查询 Agent 最近挂单、成交、过期与失败原因。
 
@@ -711,6 +777,7 @@ AGENT_TOOLS = [
     get_stock_analysis_report,
     calculate_price_by_pct,
     validate_order_price_limit,
+    calculate_position_size,
     get_recent_order_history,
     get_portfolio_risk_metrics,
     get_correlation_info,
@@ -741,6 +808,7 @@ _TOOL_CATEGORIES = {
     "get_simulation_performance": "业绩",
     "calculate_price_by_pct": "订单风控",
     "validate_order_price_limit": "订单风控",
+    "calculate_position_size": "订单风控",
     "get_recent_order_history": "订单风控",
     "get_portfolio_risk_metrics": "订单风控",
     "get_correlation_info": "订单风控",
@@ -753,6 +821,7 @@ _TOOL_CATEGORIES = {
 _MANDATORY_TOOL_NAMES = {
     "calculate_price_by_pct",
     "validate_order_price_limit",
+    "calculate_position_size",
     "get_recent_order_history",
     "get_portfolio_risk_metrics",
     "get_correlation_info",

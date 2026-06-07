@@ -71,8 +71,18 @@ class AgentOrder(BaseModel):
     order_type: str = "limit"
     quantity: int
     price: float
+    trigger_price: Optional[float] = None
+    condition_expr: Optional[str] = None
     open_get_in: bool = False
     reserved_cash: float = 0.0
+    parent_order_id: Optional[int] = None
+    oco_group: Optional[str] = None
+    chase_enabled: bool = False
+    chase_pct: float = 0.0
+    split_group: Optional[str] = None
+    split_seq: int = 1
+    split_total: int = 1
+    risk_control: bool = False
     decision_batch_id: Optional[str] = None
     fill_probability: Optional[float] = None
     price_aggressiveness: Optional[float] = None
