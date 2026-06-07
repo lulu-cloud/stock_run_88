@@ -1086,7 +1086,10 @@ def format_macro_topic(topic: str = "report", trade_date: str = "") -> str:
         return "\n".join(lines)
     if raw in {"limit_quality", "board_quality", "涨停质量", "板质量", "封板质量"}:
         limit_up = snapshot.get("limit_up") if snapshot else collect_limit_up_snapshot(effective_date)[0]
+        if not limit_up.get("analytics"):
+            limit_up = collect_limit_up_snapshot(effective_date)[0]
         analytics = limit_up.get("analytics") or _limit_pool_analytics(limit_up)
+        limit_up["analytics"] = analytics
         lines = [f"{effective_date} 涨停板质量", _format_limit_summary(limit_up)]
         lines.append("质量Top:")
         for item in (analytics.get("board_quality_top") or [])[:20]:
@@ -1100,7 +1103,10 @@ def format_macro_topic(topic: str = "report", trade_date: str = "") -> str:
         return "\n".join(lines)
     if raw in {"promotion", "advance", "晋级率", "涨停晋级", "晋级淘汰"}:
         limit_up = snapshot.get("limit_up") if snapshot else collect_limit_up_snapshot(effective_date)[0]
+        if not limit_up.get("analytics"):
+            limit_up = collect_limit_up_snapshot(effective_date)[0]
         analytics = limit_up.get("analytics") or _limit_pool_analytics(limit_up)
+        limit_up["analytics"] = analytics
         promotion = analytics.get("promotion") or {}
         lines = [
             f"{effective_date} 涨停晋级/淘汰",
