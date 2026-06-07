@@ -864,7 +864,7 @@ def get_macro_market_topic(topic: str = "report", trade_date: str = "") -> str:
     """读取每日宏观报告里的指定主题。
 
     Args:
-        topic: report/sector/lhb/limit_up/limit_down/broken_limit/strong
+        topic: report/sector/lhb/capital_flow/northbound/limit_up/limit_down/broken_limit/strong
         trade_date: 交易日期，空字符串表示最新
 
     Returns:

@@ -44,6 +44,7 @@ JSON 字段：
   "limit_up_summary": "涨停/炸板/跌停情绪摘要",
   "limit_board_quality": "基于封板资金、封板时间、炸板次数、连板数的板质量摘要",
   "limit_promotion_signal": "昨日涨停晋级率、炸板率、闷杀率和短线情绪周期判断",
+  "northbound_signal": "沪股通/深股通北向资金方向和强弱判断",
   "lhb_summary": "龙虎榜和机构/营业部资金摘要",
   "institution_signal": "机构席位信号",
   "policy_signal": "政策方向",
@@ -360,6 +361,68 @@ def collect_lhb_snapshot(trade_date: str) -> tuple[dict, list[dict]]:
             result[key] = {"count": 0, "top": [], "error": str(exc)}
             status.append(_source_error(func_name, exc))
     return result, status
+
+
+def _capital_flow_direction(net_buy: float) -> str:
+    if net_buy >= 20:
+        return "大幅净流入"
+    if net_buy >= 5:
+        return "小幅净流入"
+    if net_buy <= -20:
+        return "大幅净流出"
+    if net_buy <= -5:
+        return "小幅净流出"
+    return "中性/休市或数据接近零"
+
+
+def collect_capital_flow_snapshot(trade_date: str) -> tuple[dict, list[dict]]:
+    """Collect latest 沪深港通 fund flow summary, with 北向资金 highlighted."""
+    try:
+        ak = _load_akshare()
+    except Exception as exc:
+        return {}, [_source_error("akshare_hsgt", exc)]
+    try:
+        df = ak.stock_hsgt_fund_flow_summary_em()
+        records = _safe_records(df, 20)
+        north_rows = [row for row in records if str(row.get("资金方向") or "") == "北向"]
+        south_rows = [row for row in records if str(row.get("资金方向") or "") == "南向"]
+        north_net_buy = sum(_safe_float(row.get("成交净买额"), 0) for row in north_rows)
+        north_net_inflow = sum(_safe_float(row.get("资金净流入"), 0) for row in north_rows)
+        south_net_buy = sum(_safe_float(row.get("成交净买额"), 0) for row in south_rows)
+        source_dates = sorted({str(row.get("交易日") or "") for row in records if row.get("交易日")})
+        source_date = source_dates[-1] if source_dates else ""
+        north_channels = []
+        for row in north_rows:
+            north_channels.append({
+                "channel": row.get("板块") or row.get("类型") or "",
+                "net_buy": round(_safe_float(row.get("成交净买额"), 0), 3),
+                "net_inflow": round(_safe_float(row.get("资金净流入"), 0), 3),
+                "up_count": _safe_int(row.get("上涨数"), 0),
+                "down_count": _safe_int(row.get("下跌数"), 0),
+                "related_index": row.get("相关指数") or "",
+                "index_pct_chg": round(_safe_float(row.get("指数涨跌幅"), 0), 2),
+                "trade_status": row.get("交易状态"),
+            })
+        result = {
+            "source": "stock_hsgt_fund_flow_summary_em",
+            "source_date": source_date,
+            "requested_trade_date": trade_date,
+            "rows": records,
+            "northbound": {
+                "count": len(north_rows),
+                "net_buy": round(north_net_buy, 3),
+                "net_inflow": round(north_net_inflow, 3),
+                "direction": _capital_flow_direction(north_net_buy),
+                "channels": north_channels,
+            },
+            "southbound": {
+                "count": len(south_rows),
+                "net_buy": round(south_net_buy, 3),
+            },
+        }
+        return result, [_source_ok("stock_hsgt_fund_flow_summary_em", len(df))]
+    except Exception as exc:
+        return {"error": str(exc)}, [_source_error("stock_hsgt_fund_flow_summary_em", exc)]
 
 
 def _weighted_quantile_from_dist(dist: dict[float, float], quantiles: list[float]) -> list[float]:
@@ -740,6 +803,7 @@ def _fallback_structured(snapshot: dict) -> dict:
         "limit_up_summary": _format_limit_summary(snapshot.get("limit_up", {})),
         "limit_board_quality": _format_limit_quality_summary(snapshot.get("limit_up", {})),
         "limit_promotion_signal": _format_limit_promotion_summary(snapshot.get("limit_up", {})),
+        "northbound_signal": _format_capital_flow_summary(snapshot.get("capital_flow", {})),
         "lhb_summary": _format_lhb_summary(snapshot.get("lhb", {})),
         "institution_signal": "机构席位数据见龙虎榜摘要。",
         "policy_signal": (snapshot.get("policy", {}) or {}).get("summary", "暂无政策信号摘要。"),
@@ -796,6 +860,25 @@ def _format_lhb_summary(lhb: dict) -> str:
     )
 
 
+def _format_capital_flow_summary(capital_flow: dict) -> str:
+    if not capital_flow:
+        return "暂无沪深港通资金数据。"
+    if capital_flow.get("error"):
+        return f"沪深港通资金读取失败: {capital_flow.get('error')}"
+    north = capital_flow.get("northbound") or {}
+    channels = north.get("channels") or []
+    source_date = capital_flow.get("source_date") or capital_flow.get("requested_trade_date") or ""
+    channel_text = "；".join(
+        f"{x.get('channel')}: 净买{x.get('net_buy')}亿, {x.get('related_index')}{x.get('index_pct_chg')}%"
+        for x in channels
+    ) or "暂无北向分通道数据"
+    return (
+        f"{source_date} 北向资金{north.get('direction', '未知')}，"
+        f"成交净买额合计{north.get('net_buy', 0)}亿，资金净流入{north.get('net_inflow', 0)}亿。"
+        f"{channel_text}"
+    )
+
+
 def _build_markdown(trade_date: str, structured: dict, snapshot: dict, data_status: list[dict]) -> str:
     status_text = " / ".join(
         f"{s.get('source')}:{'ok' if s.get('ok') else 'fail'}" for s in data_status[:18]
@@ -812,6 +895,12 @@ def _build_markdown(trade_date: str, structured: dict, snapshot: dict, data_stat
         for x in quality_top[:8]
     ) or "暂无"
     promotion = limit_analytics.get("promotion") or {}
+    capital_flow = snapshot.get("capital_flow") or {}
+    northbound_text = str(structured.get("northbound_signal") or "").strip()
+    capital_fallback = _format_capital_flow_summary(capital_flow)
+    missing_northbound = any(token in northbound_text for token in ("未提供", "无北向资金", "暂无北向", "没有北向"))
+    if (not northbound_text) or (missing_northbound and not capital_fallback.startswith(("暂无", "沪深港通资金读取失败"))):
+        northbound_text = capital_fallback
     return f"""# 每日宏观市场报告 {trade_date}
 
 ## 市场状态
@@ -827,6 +916,7 @@ def _build_markdown(trade_date: str, structured: dict, snapshot: dict, data_stat
 - 涨停/炸板/跌停: {structured.get("limit_up_summary", "")}
 - 板质量Top: {quality_text}
 - 晋级/淘汰: 昨日涨停{promotion.get('previous_limit_up_count', 0)}只，晋级{promotion.get('promoted_count', 0)}只({promotion.get('promoted_rate', 0)}%)，炸板{promotion.get('broken_from_previous_count', 0)}只，闷杀{promotion.get('killed_count', 0)}只。
+- 北向资金: {northbound_text}
 - 龙虎榜: {structured.get("lhb_summary", "")}
 - 机构席位: {structured.get("institution_signal", "")}
 
@@ -914,6 +1004,10 @@ def generate_macro_report(trade_date: str = "", force: bool = False) -> dict:
 
     lhb, status = collect_lhb_snapshot(effective_date)
     snapshot["lhb"] = lhb
+    data_status.extend(status)
+
+    capital_flow, status = collect_capital_flow_snapshot(effective_date)
+    snapshot["capital_flow"] = capital_flow
     data_status.extend(status)
 
     policy, status = collect_policy_snapshot(14)
@@ -1083,6 +1177,24 @@ def format_macro_topic(topic: str = "report", trade_date: str = "") -> str:
                 net = item.get("净额") or item.get("成交额") or item.get("累积买入额") or ""
                 reason = item.get("指标") or item.get("类型") or ""
                 lines.append(f"- {code} {name} {net} {reason}".strip())
+        return "\n".join(lines)
+    if raw in {"capital_flow", "northbound", "hsgt", "北向资金", "沪深港通", "沪深港通资金"}:
+        capital_flow = snapshot.get("capital_flow") if snapshot else collect_capital_flow_snapshot(effective_date)[0]
+        if not capital_flow:
+            capital_flow = collect_capital_flow_snapshot(effective_date)[0]
+        lines = [f"{effective_date} 沪深港通资金", _format_capital_flow_summary(capital_flow)]
+        north = capital_flow.get("northbound") or {}
+        if north.get("channels"):
+            lines.append("北向分通道:")
+            for item in north["channels"]:
+                lines.append(
+                    f"- {item.get('channel')}: 成交净买{item.get('net_buy')}亿，"
+                    f"资金净流入{item.get('net_inflow')}亿，"
+                    f"{item.get('related_index')}{item.get('index_pct_chg')}%，"
+                    f"上涨{item.get('up_count')}家/下跌{item.get('down_count')}家"
+                )
+        south = capital_flow.get("southbound") or {}
+        lines.append(f"南向参考: 成交净买额合计{south.get('net_buy', 0)}亿。")
         return "\n".join(lines)
     if raw in {"limit_quality", "board_quality", "涨停质量", "板质量", "封板质量"}:
         limit_up = snapshot.get("limit_up") if snapshot else collect_limit_up_snapshot(effective_date)[0]
