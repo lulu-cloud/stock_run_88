@@ -90,9 +90,38 @@ def _memory_progress_payload(memory_context: dict) -> dict:
     }
 
 
+def _is_position_advice_query(text: str) -> bool:
+    raw = text or ""
+    position_terms = (
+        "持仓", "重仓", "满仓", "半仓", "仓位", "均价", "成本", "成本价", "买入价",
+        "亏损", "亏了", "浮亏", "盈利", "赚了", "浮盈", "回本",
+    )
+    action_terms = (
+        "清仓", "割肉", "止损", "减仓", "加仓", "补仓", "卖出", "卖吗", "要卖",
+        "怎么办", "怎么处理", "扛", "死扛", "一键",
+    )
+    has_position = any(token in raw for token in position_terms)
+    has_action = any(token in raw for token in action_terms)
+    return has_position and has_action
+
+
+def _is_stock_selection_query(text: str) -> bool:
+    raw = text or ""
+    lower = raw.lower()
+    if _is_position_advice_query(raw):
+        return False
+    return (
+        lower.startswith("/recommend")
+        or any(token in raw for token in ("推荐几", "推荐一", "选几支", "找几只", "筛选", "选股", "股票池"))
+        or any(token in raw for token in ("龙头", "强势", "连板", "回踩5", "回踩10", "回踩20", "多头均线", "均线发散"))
+    )
+
+
 def _guess_intent(text: str) -> str:
     raw = text or ""
     lower = raw.lower()
+    if _is_position_advice_query(raw):
+        return "position_advice"
     if lower.startswith("/memory") or raw.startswith("记忆"):
         return "memory"
     if any(token in raw for token in ("你是谁", "你叫什么", "你的名字")):
@@ -554,6 +583,138 @@ def _format_recommend_followup(raw: str, chat_id: str, username: str, profile: d
         _record_interest_quietly(chat_id or "local", username, code, raw, "recommend_followup", profile, user_id, thread_id)
     lines.append("仅供研究，不构成投资建议。")
     return "\n\n---\n\n".join(lines)
+
+
+def _extract_position_context(raw: str) -> dict:
+    text = raw or ""
+
+    def first_number(patterns: tuple[str, ...]) -> float:
+        for pattern in patterns:
+            m = re.search(pattern, text)
+            if m:
+                try:
+                    return float(m.group(1))
+                except Exception:
+                    continue
+        return 0.0
+
+    quantity = first_number((
+        r"(\d+(?:\.\d+)?)\s*股",
+        r"(\d+(?:\.\d+)?)\s*手",
+    ))
+    if re.search(r"\d+(?:\.\d+)?\s*手", text) and not re.search(r"\d+(?:\.\d+)?\s*股", text):
+        quantity *= 100
+    avg_cost = first_number((
+        r"(?:均价|成本价|成本|买入价)[^\d]{0,8}(\d+(?:\.\d+)?)",
+    ))
+    current_loss = first_number((
+        r"(?:亏损|亏了|浮亏|亏)[^\d]{0,8}(\d+(?:\.\d+)?)",
+        r"(\d+(?:\.\d+)?)[^\d]{0,4}(?:亏损|亏了|浮亏)",
+    ))
+    prior_profit = first_number((
+        r"(?:之前|此前|前面|原来)?[^\d]{0,6}(?:盈利|赚了|赚|利润|收益)[^\d]{0,8}(\d+(?:\.\d+)?)",
+        r"(\d+(?:\.\d+)?)[^\d]{0,6}(?:的)?(?:盈利|利润|收益)",
+    ))
+    return {
+        "quantity": quantity,
+        "avg_cost": avg_cost,
+        "current_loss": current_loss,
+        "prior_profit": prior_profit,
+    }
+
+
+def _resolve_context_stock(raw: str, chat_id: str, user_id: str = "", thread_id: str = "default") -> str:
+    explicit = extract_stock_mentions(raw)
+    if explicit:
+        return explicit[0]
+    memory_context = build_memory_prompt(chat_id or "local", user_id, thread_id, raw, None, 8)
+    prompt = memory_context.get("prompt") or ""
+    hinted = extract_stock_mentions(prompt)
+    return hinted[0] if hinted else ""
+
+
+def _format_position_advice(raw: str, chat_id: str, username: str, profile: dict | None = None,
+                            user_id: str = "", thread_id: str = "default", progress_callback=None) -> str:
+    memory_context = build_memory_prompt(chat_id or "local", user_id, thread_id, raw, None, 8)
+    if progress_callback:
+        progress_callback(_memory_progress_payload(memory_context))
+    code = _resolve_context_stock(raw, chat_id or "local", user_id, thread_id)
+    if not code:
+        return "我能做持仓处置分析，但这句没有识别到股票。你可以补一句：利通电子 700股 均价220，要不要减仓/清仓。"
+
+    if progress_callback:
+        progress_callback({
+            "type": "tool_start",
+            "tool": "recommend_analyze_stock",
+            "description": "结合最近上下文、个股行情和用户持仓成本做风险处置分析。",
+            "args": {"ts_code": code},
+        })
+    tech = build_technical_snapshot(code)
+    if progress_callback:
+        progress_callback({
+            "type": "tool",
+            "tool": "recommend_analyze_stock",
+            "description": "结合最近上下文、个股行情和用户持仓成本做风险处置分析。",
+            "args": {"ts_code": code},
+            "error": "" if tech.get("ok") else tech.get("error", "行情读取失败"),
+        })
+    if not tech.get("ok"):
+        return tech.get("error", f"{code} 行情读取失败")
+
+    ctx = _extract_position_context(raw)
+    name = lookup_stock_name(code)
+    close = float(tech.get("close") or 0)
+    ma = tech.get("ma") or {}
+    qty = float(ctx.get("quantity") or 0)
+    avg_cost = float(ctx.get("avg_cost") or 0)
+    user_loss = float(ctx.get("current_loss") or 0)
+    prior_profit = float(ctx.get("prior_profit") or 0)
+    estimated_loss = (avg_cost - close) * qty if qty > 0 and avg_cost > 0 and close > 0 else 0.0
+    loss_pct = (close - avg_cost) / avg_cost * 100 if avg_cost > 0 and close > 0 else 0.0
+    net_profit = prior_profit - (user_loss or max(0.0, estimated_loss)) if prior_profit else 0.0
+
+    bearish = close < float(ma.get("ma5") or 0) and close < float(ma.get("ma10") or 0) and close < float(ma.get("ma20") or 0)
+    severe_drop = float(tech.get("pct_chg") or 0) <= -7
+    concentration_hint = "你用了“重仓”描述，先按集中度风险偏高处理。"
+    if qty and avg_cost:
+        concentration_hint = f"持仓 {qty:.0f} 股，均价 {avg_cost:.2f}，按收盘 {close:.2f} 估算浮亏约 {max(0.0, estimated_loss):,.0f} 元（{loss_pct:.1f}%）。"
+    if user_loss and estimated_loss and abs(user_loss - estimated_loss) > max(2000, user_loss * 0.15):
+        concentration_hint += f" 你填报亏损 {user_loss:,.0f} 元，与收盘估算有差异，以券商实际为准。"
+
+    conclusion = "倾向先降风险，而不是继续重仓裸扛。"
+    if bearish or severe_drop:
+        conclusion = "倾向先执行降仓/止损纪律；如果仓位已经影响心态，一键清仓是合理选项之一。"
+    if prior_profit:
+        conclusion += " 之前在这只票赚过钱不能作为继续扛单的理由，应把当前仓位当成一笔新的风险暴露。"
+
+    lines = [
+        f"{code} {name} 持仓处置分析",
+        f"数据截至: {tech.get('trade_date')}  收盘: {close:.2f}  当日: {_fmt_pct(tech.get('pct_chg'))}",
+        "",
+        "一、你的持仓状态",
+        f"- {concentration_hint}",
+    ]
+    if prior_profit:
+        lines.append(f"- 你提到此前盈利约 {prior_profit:,.0f} 元；扣除当前亏损后，历史合计仍约 {net_profit:,.0f} 元。这个数字只能帮助你看总账，不能替代当前风控。")
+    lines.extend([
+        "",
+        "二、当前风险信号",
+        f"- MA5/10/20/60: {float(ma.get('ma5') or 0):.2f}/{float(ma.get('ma10') or 0):.2f}/{float(ma.get('ma20') or 0):.2f}/{float(ma.get('ma60') or 0):.2f}",
+        f"- 技术结构: {tech.get('summary') or '无摘要'}",
+        f"- 20日表现 {_fmt_pct(tech.get('pct_20'))}，60日表现 {_fmt_pct(tech.get('pct_60'))}",
+        "",
+        "三、可执行框架",
+        f"- 结论倾向: {conclusion}",
+        "- 如果你无法接受明天继续大跌或再跌停，优先把仓位降到自己能承受的水平；不要等情绪崩溃时再被动卖。",
+        "- 如果还想保留反弹机会，更稳的做法是先减掉 1/2 或 2/3，剩余仓位设硬止损；反抽到成本密集区再处理，而不是满仓赌反弹。",
+        "- 如果你的仓位超过总资产 50%，这已经不是单股观点问题，而是组合风险问题，先降集中度通常比判断明天涨跌更重要。",
+        "",
+        "四、我不会替你点击按钮",
+        "- 但从风控角度看：当前问题的核心不是“这票会不会反弹”，而是“继续重仓错一次还能不能承受”。",
+        "- 仅供研究和风控框架参考，不构成投资建议；最终买卖由你自己决定。",
+    ])
+    _record_interest_quietly(chat_id or "local", username, code, raw, "position_advice", profile, user_id, thread_id)
+    return "\n".join(lines)
 
 
 def _ma_bullish_snapshot(ts_code: str) -> dict:
@@ -1055,9 +1216,10 @@ RECOMMEND_TOOLS = [
 RECOMMEND_SYSTEM_PROMPT = """你是股票推荐助手，使用 ReAct 工具循环回答 Telegram 用户。
 
 要求：
-- 先识别 intent：recommend/analyze/compare/ma_check/price_volume/policy/profile/watchlist/identity/followup/backtest/intraday/feedback/help。
+- 先识别 intent：recommend/analyze/position_advice/compare/ma_check/price_volume/policy/profile/watchlist/identity/followup/backtest/intraday/feedback/help。
 - 输入 JSON 里 memory_context 已按层分开：short_term_messages 是最近 5-8 轮短期上下文，session_summary 是当前会话中期摘要，long_term_memories 是 user/chat/thread/global 长期画像。回答时优先遵守当前用户记忆，不要把群聊其他人的偏好当成当前用户偏好。
 - 用户说“上次推荐的那只/刚才那几个/继续看”时，优先结合 memory_context 中最近推荐标的和上下文回答，不能当成全新无上下文问题。
+- 用户围绕上一只股票继续说“重仓/均价/亏损/清仓/割肉/止损/减仓/怎么办”时，这是 position_advice，不是选股请求；必须结合 short_term_messages 里的上一只股票和用户成本回答，recommendations 可以为空。
 - 推荐股票时必须调用 recommend_get_user_profile(chat_id,user_id) 和 recommend_get_trader_memory；通常还要调用 recommend_search_stocks。
 - 对最终推荐中的主要标的至少抽样调用 recommend_analyze_stock 或 recommend_compare_stocks 获取证据。
 - 用户问“是否多头均线发散”时调用 recommend_check_ma_bullish；问“最近十天价格与量趋势”时调用 recommend_price_volume_trend。
@@ -1104,11 +1266,19 @@ def _extract_json_object(text: str) -> dict:
 
 def _is_simple_recommend_query(text: str) -> bool:
     raw = text or ""
+    if not _is_stock_selection_query(raw):
+        return False
     return any(k in raw for k in (
         "龙头", "强势", "涨停", "连板", "回踩5", "回踩10", "回踩20",
         "5线", "10线", "20线", "5日线", "10日线", "20日线", "20日均线", "均线回踩",
         "均线多头", "多头均线", "多头排列", "均线向上", "均线上行", "均线发散",
     ))
+
+
+def _requires_recommendations(text: str, intent: str) -> bool:
+    if (intent or "") != "recommend":
+        return False
+    return _is_stock_selection_query(text)
 
 
 def _run_rule_recommendation(
@@ -1332,7 +1502,7 @@ def run_recommend_react_agent(
             raise ValueError("recommend ReAct did not produce valid reply JSON")
         reply = data.get("reply")
         recommendations = data.get("recommendations") or []
-        if data.get("intent", "recommend") == "recommend" and not recommendations:
+        if _requires_recommendations(query, data.get("intent", "recommend")) and not recommendations:
             raise ValueError("recommend ReAct reply has no recommendations")
         rows = []
         for item in recommendations:
@@ -1374,6 +1544,41 @@ def run_recommend_react_agent(
     except Exception as exc:
         if progress_callback:
             progress_callback({"type": "phase", "message": "ReAct 输出不可用，切换到规则链兜底。"})
+        if _is_position_advice_query(query):
+            reply = _format_position_advice(
+                query,
+                chat_id or "local",
+                username,
+                get_profile(_context_key(chat_id or "local", user_id)),
+                user_id,
+                thread_id,
+                progress_callback,
+            )
+            eval_id = record_recommend_eval(
+                chat_id or "local",
+                username,
+                query,
+                reply,
+                [],
+                {
+                    "trace_summary": "position_advice_fallback",
+                    "fallback_error": str(exc),
+                    "failed_react_trace": tool_trace,
+                },
+                tool_trace,
+                0,
+                intent="position_advice",
+                status="fallback",
+                fallback_used=True,
+            )
+            return {
+                "message": reply,
+                "trace_id": None,
+                "recommendation_ids": [],
+                "eval_id": eval_id,
+                "error": str(exc),
+                "fallback": True,
+            }
         result = _run_rule_recommendation(
             query,
             chat_id or "local",
@@ -1464,6 +1669,8 @@ def _handle_text_message_inner(
     lower = raw.lower()
     profile_key = _context_key(chat_id or "local", user_id)
     profile = apply_inferred_preferences(profile_key, raw, username) if chat_id else None
+    if _is_position_advice_query(raw):
+        return _format_position_advice(raw, chat_id or "local", username, profile, user_id, thread_id, progress_callback)
     if _record_text_feedback(chat_id or "local", username, raw):
         if any(token in raw for token in ("太激进", "太冒险", "恐高")):
             update_profile(profile_key, {"risk_level": "低"}, username)

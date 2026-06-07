@@ -87,6 +87,7 @@ class _TelegramProgress:
                 "policy": "政策偏好",
                 "ma_check": "均线判断",
                 "followup": "上下文追问",
+                "position_advice": "持仓处置",
                 "identity": "身份介绍",
                 "chat": "普通对话",
             }
