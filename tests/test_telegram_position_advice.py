@@ -53,6 +53,27 @@ class TelegramPositionAdviceTestCase(unittest.TestCase):
         advice.assert_called_once()
         feedback.assert_not_called()
 
+    def test_emotional_risk_help_is_not_feedback(self):
+        text = "想赚钱想疯了，咋办，给我点建议？给我点冷水。"
+
+        self.assertTrue(recommender._is_emotional_risk_help_query(text))
+        self.assertEqual(recommender._detect_text_feedback_type(text), "")
+
+        with patch.object(recommender, "_record_text_feedback", return_value=True) as feedback:
+            reply = recommender._handle_text_message_inner(text, chat_id="chat", username="lili")
+
+        self.assertIn("先停手", reply)
+        self.assertIn("高风险信号", reply)
+        feedback.assert_not_called()
+
+    def test_feedback_requires_recommendation_context(self):
+        self.assertEqual(recommender._detect_text_feedback_type("想赚钱想疯了，咋办"), "")
+        self.assertEqual(recommender._detect_text_feedback_type("按你推荐买了，赚钱了"), "positive")
+        self.assertEqual(recommender._detect_text_feedback_type("你刚才推荐的票跌了"), "negative")
+        self.assertEqual(recommender._detect_text_feedback_type("你推荐太激进了"), "risk_too_high")
+        self.assertEqual(recommender._detect_text_feedback_type("你太保守了，机会少"), "")
+        self.assertEqual(recommender._detect_text_feedback_type("按你建议太保守了，机会少"), "risk_too_low")
+
 
 if __name__ == "__main__":
     unittest.main()

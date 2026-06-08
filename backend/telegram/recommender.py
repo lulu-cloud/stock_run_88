@@ -114,6 +114,18 @@ def _is_position_advice_query(text: str) -> bool:
     return has_position and has_action
 
 
+def _is_emotional_risk_help_query(text: str) -> bool:
+    raw = text or ""
+    if not raw:
+        return False
+    emotional_terms = (
+        "想赚钱想疯", "给我点冷水", "冷水", "上头", "冲动", "翻本", "心态",
+        "控制不住", "停不下来", "管不住手", "想一把梭", "梭哈",
+    )
+    help_terms = ("咋办", "怎么办", "建议", "劝", "骂醒", "冷静")
+    return any(token in raw for token in emotional_terms) and any(token in raw for token in help_terms)
+
+
 def _is_stock_selection_query(text: str) -> bool:
     raw = text or ""
     lower = raw.lower()
@@ -144,6 +156,8 @@ def _guess_intent(text: str) -> str:
     lower = raw.lower()
     if _is_position_advice_query(raw):
         return "position_advice"
+    if _is_emotional_risk_help_query(raw):
+        return "help"
     if lower.startswith("/memory") or raw.startswith("记忆"):
         return "memory"
     if any(token in raw for token in ("你是谁", "你叫什么", "你的名字")):
@@ -974,19 +988,60 @@ def _identity_reply(chat_id: str, user_id: str = "", thread_id: str = "default")
     ])
 
 
+def _format_emotional_risk_help(raw: str, profile: dict | None = None) -> str:
+    risk_level = (profile or {}).get("risk_level", "中等")
+    horizon = (profile or {}).get("horizon", "短线")
+    return "\n".join([
+        "先停手。你现在这句“想赚钱想疯了”本身就是高风险信号，今晚不适合做任何追单决定。",
+        "",
+        "给你几盆冷水:",
+        "1. 想快速赚钱时，最容易把交易做成情绪消费。",
+        "2. 想翻本时，大脑会自动忽略止损、仓位和胜率，只盯着回本速度。",
+        "3. 市场不会因为你急就给机会，越急越容易买在一致性高点。",
+        "",
+        "今晚执行规则:",
+        "- 不新增买入计划，不临时加自选股，不因为一条消息或一个概念追进去。",
+        "- 先写清楚明天最多亏多少钱、单票最多几成仓、跌破哪里必须退出。",
+        "- 如果没有买点、止损点、仓位上限这三项，就视为没有交易计划。",
+        "",
+        f"按你当前画像: 风险{risk_level}，周期{horizon}。这种状态下先把仓位和规则写下来，比找下一只票更重要。",
+        "",
+        "仅供交易纪律参考，不构成投资建议。",
+    ])
+
+
+def _detect_text_feedback_type(text: str) -> str:
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    lowered = raw.lower()
+    if _is_emotional_risk_help_query(raw):
+        return ""
+
+    recommendation_context_terms = (
+        "按你推荐", "按你说", "按你建议", "你推荐", "你说的", "你刚才", "刚才推荐",
+        "刚刚推荐", "上次推荐", "上次那只", "推荐的", "采纳", "没采纳", "听你的",
+        "照你说", "照你建议",
+    )
+    has_context = any(token in raw for token in recommendation_context_terms)
+    if not has_context:
+        return ""
+
+    if any(token in raw for token in ("太激进", "太冒险", "恐高")):
+        return "risk_too_high"
+    if any(token in raw for token in ("太保守", "机会少")) or "conservative" in lowered:
+        return "risk_too_low"
+    if any(token in raw for token in ("跌了", "亏了", "不好", "失败", "不喜欢", "没用")):
+        return "negative"
+    if any(token in raw for token in ("涨了", "赚了", "赚钱了", "不错", "采纳")):
+        return "positive"
+    return ""
+
+
 def _record_text_feedback(chat_id: str, username: str, text: str) -> bool:
     if not chat_id:
         return False
-    lowered = text.lower()
-    feedback_type = ""
-    if any(token in text for token in ("跌了", "亏了", "不好", "失败", "不喜欢")):
-        feedback_type = "negative"
-    elif any(token in text for token in ("涨了", "赚钱", "不错", "采纳")):
-        feedback_type = "positive"
-    elif any(token in text for token in ("太激进", "太冒险", "恐高")):
-        feedback_type = "risk_too_high"
-    elif any(token in text for token in ("太保守", "机会少")) or "conservative" in lowered:
-        feedback_type = "risk_too_low"
+    feedback_type = _detect_text_feedback_type(text)
     if not feedback_type:
         return False
     conn = get_conn()
@@ -1787,6 +1842,8 @@ def _handle_text_message_inner(
     profile = apply_inferred_preferences(profile_key, raw, username) if chat_id else None
     if _is_position_advice_query(raw):
         return _format_position_advice(raw, chat_id or "local", username, profile, user_id, thread_id, progress_callback)
+    if _is_emotional_risk_help_query(raw):
+        return _format_emotional_risk_help(raw, profile)
     if _record_text_feedback(chat_id or "local", username, raw):
         if any(token in raw for token in ("太激进", "太冒险", "恐高")):
             update_profile(profile_key, {"risk_level": "低"}, username)
