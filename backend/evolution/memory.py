@@ -138,33 +138,31 @@ def seed_agent_style_memory(agent_id: int, agent_name: str = "", agent_config: d
     """Keep each trading agent's preference memory anchored to its own style."""
     memory = ensure_memory_files(agent_id)
     current = (memory.get("trade_prefer") or "").strip()
-    if "Agent风格锚点" in current:
-        return {"changed": False, "reason": "exists"}
-
     config = agent_config or {}
     preferred = config.get("preferred_strategies") or []
     if isinstance(preferred, str):
         preferred = [x.strip() for x in preferred.split(",") if x.strip()]
+    agent_type = str(config.get("agent_type") or "").strip()
     joined = " ".join(filter(None, [
         str(agent_name or ""),
-        str(config.get("agent_type") or ""),
+        agent_type,
         str(config.get("style_prompt") or ""),
         str(config.get("user_strategy_original") or ""),
         " ".join(str(x) for x in preferred),
     ]))
     user_strategy = re.sub(r"\s+", " ", str(config.get("user_strategy_original") or "")).strip()[:220]
 
-    if str(config.get("agent_type") or "") == "user_style" or user_strategy:
+    if agent_type == "user_style" or user_strategy:
         anchor = (
             "- Agent风格锚点: 用户风格交易员；用户写入的原始策略是最高风格锚点，进化只补充执行细节。"
             f"优先策略[{', '.join(preferred) or '未配置'}]；原始策略摘要: {user_strategy or '按前端用户策略执行'}。"
         )
-    elif "追高" in joined or "打板" in joined or "chaser" in joined:
+    elif agent_type == "chaser" or (not agent_type and ("追高" in joined or "打板" in joined or "chaser" in joined)):
         anchor = (
             "- Agent风格锚点: 短线情绪/打板交易员；打板与多头均线右侧趋势并重。"
             "只做封板质量、换手、板块温度和次日离场条件都清楚的机会。"
         )
-    elif "自主" in joined or "autonomous" in joined:
+    elif agent_type == "autonomous" or "自主" in joined or "autonomous" in joined:
         anchor = (
             "- Agent风格锚点: 全因子自主交易员；综合政策、基本面、技术、资金和情绪，"
             "避免复制打板思路，重视仓位分散、相关性和风险收益比。"
@@ -175,7 +173,10 @@ def seed_agent_style_memory(agent_id: int, agent_name: str = "", agent_config: d
             "样本不足时先稳健执行并记录可复盘证据。"
         )
 
-    text = _trim("\n".join(filter(None, [current, anchor])), PREFER_LIMIT)
+    if anchor in current:
+        return {"changed": False, "reason": "exists"}
+    kept_lines = [line for line in current.splitlines() if "Agent风格锚点" not in line]
+    text = _trim("\n".join(filter(None, ["\n".join(kept_lines).strip(), anchor])), PREFER_LIMIT)
     with open(_path(agent_id, "trade_prefer.md"), "w", encoding="utf-8") as f:
         f.write(text.rstrip() + "\n")
     return {"changed": True, "anchor": anchor}

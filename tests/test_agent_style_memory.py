@@ -32,6 +32,28 @@ class AgentStyleMemoryTestCase(unittest.TestCase):
         self.assertIn("短线情绪/打板交易员", snapshot["trade_prefer"])
         self.assertIn("封板质量", snapshot["trade_prefer"])
 
+    def test_agent_type_overrides_generic_style_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(memory, "ROOT_DIR", tmp):
+                memory.seed_agent_style_memory(4, "自主决策Agent", {
+                    "agent_type": "autonomous",
+                    "style_prompt": "可以参考打板数据，但不要简单复制。",
+                })
+                snapshot = memory.read_memory(4)
+
+        self.assertIn("全因子自主交易员", snapshot["trade_prefer"])
+        self.assertNotIn("短线情绪/打板交易员", snapshot["trade_prefer"])
+
+    def test_existing_style_anchor_can_be_refreshed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(memory, "ROOT_DIR", tmp):
+                memory.seed_agent_style_memory(4, "自主决策Agent", {"agent_type": "chaser"})
+                memory.seed_agent_style_memory(4, "自主决策Agent", {"agent_type": "autonomous"})
+                snapshot = memory.read_memory(4)
+
+        self.assertIn("全因子自主交易员", snapshot["trade_prefer"])
+        self.assertNotIn("短线情绪/打板交易员", snapshot["trade_prefer"])
+
 
 if __name__ == "__main__":
     unittest.main()
