@@ -278,6 +278,7 @@ class ReActLoop:
                     "tool": tool_name,
                     "description": tool_desc,
                     "args": tool_args,
+                    "result_preview": self._result_preview(result_text),
                     "error": tool_error,
                 })
                 messages.append(ToolMessage(content=result_text, tool_call_id=tool_id))
@@ -358,3 +359,22 @@ class ReActLoop:
         if not desc:
             return ""
         return re.sub(r"\s+", " ", desc.splitlines()[0]).strip()[:160]
+
+    def _result_preview(self, result: str) -> str:
+        text = str(result or "").strip()
+        if not text:
+            return ""
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                summary = data.get("summary") or data.get("message") or data.get("explanation") or data.get("error")
+                if summary:
+                    text = str(summary)
+                else:
+                    keys = list(data.keys())[:5]
+                    text = "返回字段: " + ", ".join(str(k) for k in keys)
+            elif isinstance(data, list):
+                text = f"返回列表 {len(data)} 条"
+        except Exception:
+            pass
+        return re.sub(r"\s+", " ", text).strip()[:220]

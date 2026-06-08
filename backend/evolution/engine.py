@@ -7,13 +7,15 @@ import os
 from datetime import datetime
 
 from backend.config import LOGS_DIR
-from backend.evolution.memory import snapshot_memory, update_memory
+from backend.evolution.memory import seed_agent_style_memory, snapshot_memory, update_memory
 from backend.evolution.minute_replay import build_intraday_replay
 from backend.evolution.skills import ensure_default_skills, list_skill_index, update_skill_confidence
 
 
 def prepare_evolution_context(agent_id: int, agent_name: str, trade_date: str, conn) -> dict:
     ensure_default_skills(agent_id, agent_name, conn)
+    agent_config = _load_agent_config(agent_id, conn)
+    seed_agent_style_memory(agent_id, agent_name, agent_config)
     memory_snapshot = snapshot_memory(agent_id, trade_date)
     skills = list_skill_index(agent_id, conn)
     last_event = conn.execute(
@@ -44,6 +46,31 @@ def prepare_evolution_context(agent_id: int, agent_name: str, trade_date: str, c
         "skills": skills,
         "system_doc": system_doc,
         "previous_evolution": previous,
+    }
+
+
+def _load_agent_config(agent_id: int, conn) -> dict:
+    try:
+        row = conn.execute(
+            "SELECT agent_type, strategy_ids, risk_config FROM agent_info WHERE id=?",
+            (agent_id,),
+        ).fetchone()
+    except Exception:
+        row = None
+    if not row:
+        return {}
+    try:
+        risk_config = json.loads(row["risk_config"] or "{}")
+    except Exception:
+        risk_config = {}
+    preferred = risk_config.get("preferred_strategies")
+    if not preferred:
+        preferred = [x.strip() for x in str(row["strategy_ids"] or "").split(",") if x.strip()]
+    return {
+        "agent_type": row["agent_type"] or "",
+        "style_prompt": risk_config.get("style_prompt") or "",
+        "user_strategy_original": risk_config.get("user_strategy_original") or "",
+        "preferred_strategies": preferred,
     }
 
 

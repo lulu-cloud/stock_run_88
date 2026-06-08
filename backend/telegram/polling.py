@@ -47,12 +47,12 @@ class _TelegramProgress:
 
     def start(self):
         send_chat_action(self.chat_id, "typing")
-        result = send_message(self.chat_id, "正在处理你的问题...")
+        result = send_message(self.chat_id, "⏳ 正在处理你的问题...")
         if result.get("ok"):
             self.message_id = int((result.get("result") or {}).get("message_id") or 0)
         else:
             _state["last_send_error"] = result.get("error", "")
-        self.lines = ["正在处理你的问题..."]
+        self.lines = ["⏳ 正在处理你的问题..."]
 
     def on_event(self, event: dict):
         send_chat_action(self.chat_id, "typing")
@@ -77,7 +77,7 @@ class _TelegramProgress:
     def _format_event(self, event: dict) -> str:
         event_type = event.get("type")
         if event_type == "phase":
-            return str(event.get("message") or "").strip()
+            return "🔎 " + str(event.get("message") or "").strip()
         if event_type == "intent":
             intent = event.get("intent") or "chat"
             labels = {
@@ -91,62 +91,82 @@ class _TelegramProgress:
                 "identity": "身份介绍",
                 "chat": "普通对话",
             }
-            return f"识别意图: {labels.get(intent, intent)}"
+            return f"🎯 识别意图: {labels.get(intent, intent)}"
         if event_type == "memory_context":
             short_count = int(event.get("short_count") or 0)
             memory_count = int(event.get("memory_count") or 0)
             has_summary = "有" if event.get("has_session_summary") else "无"
-            lines = [f"加载记忆: 短期{short_count}条 / 长期{memory_count}条 / 会话摘要{has_summary}"]
+            lines = [f"🧠 加载记忆: 短期{short_count}条 / 长期{memory_count}条 / 会话摘要{has_summary}"]
             summary = self._clip(event.get("session_summary") or "", 90)
             if summary:
-                lines.append(f"会话摘要: {summary}")
+                lines.append(f"   摘要: {summary}")
             memories = [self._clip(x, 72) for x in (event.get("memory_preview") or []) if str(x).strip()]
             if memories:
-                lines.append("相关记忆: " + "；".join(memories[:2]))
+                lines.append("   相关: " + "；".join(memories[:2]))
+            recent = [self._clip(x, 82) for x in (event.get("recent_preview") or []) if str(x).strip()]
+            if recent:
+                lines.append("   最近: " + " / ".join(recent[-2:]))
             return "\n".join(lines)
         if event_type == "rule_start":
-            return "已识别为规则选股请求，准备调用选股工具。"
+            return "🧭 已识别为规则选股请求，准备调用选股工具。"
         if event_type == "strategy_parse":
             strategy = event.get("strategy") or "custom"
             explanation = event.get("explanation") or ""
-            return f"解析策略: {strategy} {explanation}".strip()
+            return f"🧩 解析策略: {strategy} {explanation}".strip()
         if event_type == "tool_start":
             tool = event.get("tool") or "unknown_tool"
             args = self._format_args(event.get("args") or {})
             desc = self._clip(event.get("description") or self._known_tool_description(tool), 110)
-            lines = [f"正在调用工具: {tool}{args}"]
+            lines = [f"🛠️ 调用工具: {tool}"]
+            if args:
+                lines.append(f"   参数: {args}")
             if desc:
-                lines.append(f"用途: {desc}")
+                lines.append(f"   用途: {desc}")
             return "\n".join(lines)
         if event_type == "tool":
             tool = event.get("tool") or "unknown_tool"
             suffix = "失败" if event.get("error") else "完成"
             desc = self._clip(event.get("description") or self._known_tool_description(tool), 90)
-            return f"工具{suffix}: {tool}" + (f"\n结果来源: {desc}" if desc and not event.get("error") else "")
+            preview = self._clip(event.get("result_preview") or "", 120)
+            lines = [f"{'❌' if event.get('error') else '✅'} 工具{suffix}: {tool}"]
+            if desc and not event.get("error"):
+                lines.append(f"   来源: {desc}")
+            if preview and not event.get("error"):
+                lines.append(f"   摘要: {preview}")
+            if event.get("error"):
+                lines.append(f"   错误: {self._clip(event.get('error'), 100)}")
+            return "\n".join(lines)
         if event_type == "llm_turn":
             turn = event.get("turn") or ""
             stage_tools = event.get("stage_tools") or []
-            return f"生成计划: 第 {turn} 轮，可用工具{len(stage_tools)}个"
+            sample = "、".join(str(x) for x in stage_tools[:3])
+            return f"🧭 生成计划: 第 {turn} 轮，可用工具{len(stage_tools)}个" + (f"\n   可用: {sample}" if sample else "")
         if event_type == "llm_decision":
             tools = [x for x in (event.get("tools") or []) if x]
             if tools:
                 descriptions = event.get("tool_descriptions") or {}
-                lines = ["决策: 需要调用 " + "、".join(tools[:4])]
+                lines = ["🤖 决策: 需要调用 " + "、".join(tools[:4])]
                 for name in tools[:3]:
                     desc = self._clip(descriptions.get(name) or self._known_tool_description(name), 72)
                     if desc:
-                        lines.append(f"- {name}: {desc}")
+                        lines.append(f"   - {name}: {desc}")
                 return "\n".join(lines)
-            return "决策: 已有证据足够，准备组织回复"
+            return "🤖 决策: 已有证据足够，准备组织回复"
         if event_type == "finalizing":
-            return "正在整合证据，生成最终回复"
+            return "✍️ 正在整合证据，生成最终回复"
         return ""
 
     def _format_args(self, args: dict) -> str:
         if not args:
             return ""
-        keys = [str(k) for k in list(args.keys())[:3]]
-        return " (" + ", ".join(keys) + ")"
+        parts = []
+        for key, value in list(args.items())[:4]:
+            if any(secret in str(key).lower() for secret in ("token", "key", "secret", "password")):
+                display = "***"
+            else:
+                display = self._clip(value, 42)
+            parts.append(f"{key}={display}")
+        return ", ".join(parts)
 
     def _clip(self, text: str, limit: int) -> str:
         value = " ".join(str(text or "").split())

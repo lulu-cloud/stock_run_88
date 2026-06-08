@@ -6,6 +6,20 @@ from backend.agents.base import AgentContext, AgentDecision
 from backend.config import REPORTS_DIR
 
 
+def _no_action_note(trades: list[dict], decision: AgentDecision | None) -> str:
+    if trades or (decision and decision.orders):
+        return ""
+    if not decision:
+        return "本轮没有成交且 Agent 未生成有效决策，需检查 LLM 调用、工具链或超时日志。"
+    source = " ".join(filter(None, [decision.risk_assessment or "", decision.market_analysis or ""])).strip()
+    if source:
+        return (
+            "本轮没有成交、没有新条件单。Agent 给出的观望依据摘要: "
+            + source[:500]
+        )
+    return "本轮没有成交、没有新条件单，但 Agent 未给出充分观望理由；已标记为复盘改进项。"
+
+
 def generate_daily_report(agent_id: int, agent_name: str, trade_date: str,
                           context: AgentContext, trades: list[dict],
                           decision: AgentDecision | None = None,
@@ -51,6 +65,7 @@ def generate_daily_report(agent_id: int, agent_name: str, trade_date: str,
                 f"{'是' if o.get('open_get_in') else '否'} | {o.get('skill_id', '')} | "
                 f"{float(o.get('skill_confidence') or 0):.2f} | {o.get('reason', '')} |\n"
             )
+    no_action_note = _no_action_note(trades, decision)
     evolution_md = ""
     evo = context.evolution_context or {}
     for skill in (evo.get("skills") or [])[:6]:
@@ -97,6 +112,8 @@ def generate_daily_report(agent_id: int, agent_name: str, trade_date: str,
 ## 4. 操作总结
 
 {decision.market_analysis if decision else 'Agent 未生成分析。'}
+
+{('### 无操作说明\n\n' + no_action_note) if no_action_note else ''}
 
 ## 5. 新生成条件单
 

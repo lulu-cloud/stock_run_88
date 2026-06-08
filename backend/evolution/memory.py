@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime
 
 from backend.config import ROOT_DIR
@@ -133,6 +134,53 @@ def ensure_memory_files(agent_id: int) -> dict:
     return read_memory(agent_id)
 
 
+def seed_agent_style_memory(agent_id: int, agent_name: str = "", agent_config: dict | None = None) -> dict:
+    """Keep each trading agent's preference memory anchored to its own style."""
+    memory = ensure_memory_files(agent_id)
+    current = (memory.get("trade_prefer") or "").strip()
+    if "Agent风格锚点" in current:
+        return {"changed": False, "reason": "exists"}
+
+    config = agent_config or {}
+    preferred = config.get("preferred_strategies") or []
+    if isinstance(preferred, str):
+        preferred = [x.strip() for x in preferred.split(",") if x.strip()]
+    joined = " ".join(filter(None, [
+        str(agent_name or ""),
+        str(config.get("agent_type") or ""),
+        str(config.get("style_prompt") or ""),
+        str(config.get("user_strategy_original") or ""),
+        " ".join(str(x) for x in preferred),
+    ]))
+    user_strategy = re.sub(r"\s+", " ", str(config.get("user_strategy_original") or "")).strip()[:220]
+
+    if str(config.get("agent_type") or "") == "user_style" or user_strategy:
+        anchor = (
+            "- Agent风格锚点: 用户风格交易员；用户写入的原始策略是最高风格锚点，进化只补充执行细节。"
+            f"优先策略[{', '.join(preferred) or '未配置'}]；原始策略摘要: {user_strategy or '按前端用户策略执行'}。"
+        )
+    elif "追高" in joined or "打板" in joined or "chaser" in joined:
+        anchor = (
+            "- Agent风格锚点: 短线情绪/打板交易员；打板与多头均线右侧趋势并重。"
+            "只做封板质量、换手、板块温度和次日离场条件都清楚的机会。"
+        )
+    elif "自主" in joined or "autonomous" in joined:
+        anchor = (
+            "- Agent风格锚点: 全因子自主交易员；综合政策、基本面、技术、资金和情绪，"
+            "避免复制打板思路，重视仓位分散、相关性和风险收益比。"
+        )
+    else:
+        anchor = (
+            "- Agent风格锚点: 自定义均衡交易员；优先遵守前端配置的策略、工具、股票池和阶段提示词，"
+            "样本不足时先稳健执行并记录可复盘证据。"
+        )
+
+    text = _trim("\n".join(filter(None, [current, anchor])), PREFER_LIMIT)
+    with open(_path(agent_id, "trade_prefer.md"), "w", encoding="utf-8") as f:
+        f.write(text.rstrip() + "\n")
+    return {"changed": True, "anchor": anchor}
+
+
 def compress_agent_memory(agent_id: int) -> dict:
     ensure_memory_files(agent_id)
     results = {
@@ -156,7 +204,11 @@ def read_memory(agent_id: int) -> dict:
         ("short_ring", "short_ring.md"),
     ):
         path = _path(agent_id, filename)
-        result[key] = open(path, "r", encoding="utf-8").read() if os.path.exists(path) else ""
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                result[key] = f.read()
+        else:
+            result[key] = ""
     return result
 
 

@@ -74,19 +74,28 @@ def _context_key(chat_id: str, user_id: str = "") -> str:
 def _memory_progress_payload(memory_context: dict) -> dict:
     session_summary = memory_context.get("session_summary") or {}
     memories = memory_context.get("long_term_memories") or memory_context.get("memories") or []
+    recent_messages = memory_context.get("short_term_messages") or []
     preview = []
     for item in memories[:3]:
         content = item.get("content") if isinstance(item, dict) else item
         content = str(content or "").strip()
         if content:
             preview.append(content[:120])
+    recent_preview = []
+    for item in recent_messages[-4:]:
+        role = item.get("role") if isinstance(item, dict) else ""
+        content = item.get("content") if isinstance(item, dict) else item
+        content = str(content or "").strip()
+        if content:
+            recent_preview.append(f"{role or 'message'}: {content[:90]}")
     return {
         "type": "memory_context",
-        "short_count": len(memory_context.get("short_term_messages") or []),
+        "short_count": len(recent_messages),
         "memory_count": len(memories),
         "has_session_summary": bool(session_summary.get("summary")),
         "session_summary": str(session_summary.get("summary") or "")[:160],
         "memory_preview": preview,
+        "recent_preview": recent_preview,
     }
 
 
@@ -117,6 +126,19 @@ def _is_stock_selection_query(text: str) -> bool:
     )
 
 
+def _is_contextual_stock_followup(text: str) -> bool:
+    raw = (text or "").strip()
+    if not raw or not extract_stock_mentions(raw):
+        return False
+    if any(token in raw for token in ("选几支", "找几只", "筛选", "股票池", "回测")):
+        return False
+    return (
+        raw.startswith(("那", "那么", "这个", "这只", "那只", "再看", "再说", "再帮我看"))
+        or raw.endswith(("呢", "吗", "？", "?"))
+        or len(raw) <= 18
+    )
+
+
 def _guess_intent(text: str) -> str:
     raw = text or ""
     lower = raw.lower()
@@ -127,6 +149,8 @@ def _guess_intent(text: str) -> str:
     if any(token in raw for token in ("你是谁", "你叫什么", "你的名字")):
         return "identity"
     if any(token in raw for token in ("上次推荐", "刚才推荐", "刚刚推荐", "上次那只", "刚才那只", "那几个怎么样")):
+        return "followup"
+    if _is_contextual_stock_followup(raw):
         return "followup"
     if lower.startswith(("/backtest", "/bt")) or "回测" in raw:
         return "backtest"
@@ -585,6 +609,57 @@ def _format_recommend_followup(raw: str, chat_id: str, username: str, profile: d
     return "\n\n---\n\n".join(lines)
 
 
+def _infer_previous_stock_task(memory_context: dict) -> str:
+    text = " ".join(str((m or {}).get("content") or "") for m in (memory_context.get("short_term_messages") or [])[-8:])
+    if any(token in text for token in ("买卖", "能不能买", "要不要卖", "是否推荐", "清仓", "减仓", "止损")):
+        return "买卖处置/是否推荐"
+    if any(token in text for token in ("对比", "比较")):
+        return "对比分析"
+    if any(token in text for token in ("多头均线", "均线发散", "回踩")):
+        return "均线结构检查"
+    return "单股延续分析"
+
+
+def _format_contextual_stock_followup(raw: str, chat_id: str, username: str, profile: dict | None = None,
+                                      user_id: str = "", thread_id: str = "default",
+                                      progress_callback=None) -> str:
+    memory_context = build_memory_prompt(chat_id or "local", user_id, thread_id, raw, None, 8)
+    if progress_callback:
+        progress_callback(_memory_progress_payload(memory_context))
+    codes = extract_stock_mentions(raw)
+    if not codes:
+        return _format_recommend_followup(raw, chat_id, username, profile, user_id, thread_id)
+    task = _infer_previous_stock_task(memory_context)
+    if progress_callback:
+        progress_callback({
+            "type": "phase",
+            "message": f"识别为省略式追问，沿用上轮任务类型: {task}。",
+        })
+        progress_callback({
+            "type": "tool_start",
+            "tool": "recommend_analyze_stock",
+            "description": "沿用最近对话语境，对新提到的股票做同类分析。",
+            "args": {"codes": codes[:3], "context_task": task},
+        })
+    reports = []
+    for code in codes[:3]:
+        reports.append(generate_stock_report(code, profile))
+        _record_interest_quietly(chat_id or "local", username, code, raw, "contextual_stock_followup", profile, user_id, thread_id)
+    if progress_callback:
+        progress_callback({
+            "type": "tool",
+            "tool": "recommend_analyze_stock",
+            "description": "沿用最近对话语境，对新提到的股票做同类分析。",
+            "args": {"count": len(reports)},
+            "result_preview": f"已生成{len(reports)}只股票的{task}报告。",
+        })
+    return "\n\n".join([
+        f"我按上一轮“{task}”的语境，继续看你新提到的股票。",
+        "\n\n---\n\n".join(reports),
+        "仅供研究，不构成投资建议。",
+    ])
+
+
 def _extract_position_context(raw: str) -> dict:
     text = raw or ""
 
@@ -656,6 +731,10 @@ def _format_position_advice(raw: str, chat_id: str, username: str, profile: dict
             "tool": "recommend_analyze_stock",
             "description": "结合最近上下文、个股行情和用户持仓成本做风险处置分析。",
             "args": {"ts_code": code},
+            "result_preview": (
+                f"收盘{tech.get('close')}，当日{tech.get('pct_chg')}%，"
+                f"结构: {tech.get('summary') or '-'}"
+            ) if tech.get("ok") else "",
             "error": "" if tech.get("ok") else tech.get("error", "行情读取失败"),
         })
     if not tech.get("ok"):
@@ -957,6 +1036,7 @@ def format_recommendation(query: str, max_results: int | None = None,
             "tool": "recommend_search_stocks",
             "description": "按自然语言策略筛选候选股票。",
             "args": {"strategy": result.get("strategy"), "total": result.get("total")},
+            "result_preview": f"筛到{len(result.get('results') or [])}只候选，策略={result.get('strategy') or parsed.get('strategy') or 'custom'}。",
         })
     rows = result.get("results") or []
     public_context = best_public_agent_context()
@@ -966,6 +1046,7 @@ def format_recommendation(query: str, max_results: int | None = None,
             "tool": "recommend_get_trader_memory",
             "description": "读取交易员体系、赛马表现和推荐技能记忆。",
             "args": {},
+            "result_preview": compact_trace_text(public_context),
         })
 
     if not rows:
@@ -1780,6 +1861,9 @@ def _handle_text_message_inner(
         return format_macro_topic("sector")
 
     stock_codes = extract_stock_mentions(raw)
+    if stock_codes and _is_contextual_stock_followup(raw):
+        return _format_contextual_stock_followup(raw, chat_id or "local", username, profile, user_id, thread_id, progress_callback)
+
     if stock_codes and any(token in raw for token in ("筹码峰", "筹码分布", "筹码")):
         lines = [format_chip_distribution(code) for code in stock_codes[:3]]
         for code in stock_codes[:3]:
@@ -1835,6 +1919,7 @@ def _handle_text_message_inner(
                 "tool": "recommend_analyze_stock",
                 "description": "分析单只股票的技术面、趋势、风险和推荐理由。",
                 "args": {"count": len(reports)},
+                "result_preview": f"已生成{len(reports)}份单股结构化分析。",
             })
         return "\n\n---\n\n".join(reports)
 
