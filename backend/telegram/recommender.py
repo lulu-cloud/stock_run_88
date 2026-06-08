@@ -1345,6 +1345,32 @@ def _extract_json_object(text: str) -> dict:
     return {}
 
 
+def _coerce_markdown_react_reply(raw_output: str, user_input: str) -> dict:
+    """Accept a substantial final Markdown answer when the model forgot JSON wrapping."""
+    text = (raw_output or "").strip()
+    if len(text) < 120:
+        return {}
+    markers = ("📌", "##", "一、", "结论", "风险提示", "仅供研究", "不构成投资建议")
+    if not any(marker in text for marker in markers):
+        return {}
+    starts = [idx for marker in ("---\n\n📌", "\n\n📌", "📌", "##", "一、") if (idx := text.find(marker)) >= 0]
+    if starts:
+        text = text[min(starts):].lstrip("- \n")
+    text = re.sub(r"^(现在|我需要|让我|用户).{0,140}\n", "", text).strip()
+    if not any(marker in text for marker in ("结论", "风险提示", "仅供研究", "不构成投资建议", "建议")):
+        return {}
+    if "不构成投资建议" not in text:
+        text = text.rstrip() + "\n\n⚠️ 风险提示：以上分析仅供研究参考，不构成投资建议。"
+    return {
+        "intent": _guess_intent(user_input),
+        "reply": text,
+        "recommendations": [],
+        "risk_notes": ["模型未按 JSON 输出，已保留其最终 Markdown 正文。"],
+        "trace_summary": "ReAct 已完成工具分析，但最终未包成 JSON；系统将 Markdown 正文转为有效回复。",
+        "_coerced_from_markdown": True,
+    }
+
+
 def _is_simple_recommend_query(text: str) -> bool:
     raw = text or ""
     if not _is_stock_selection_query(raw):
@@ -1514,6 +1540,7 @@ def _run_recommend_loop(
     )
     raw_output = result.output
     data = _extract_json_object(raw_output)
+    json_parse_ok = bool(data)
     if not data:
         result.trace.append({
             "type": "parse",
@@ -1522,7 +1549,15 @@ def _run_recommend_loop(
             "output_part_count": 1 if raw_output else 0,
             "raw_output_preview": raw_output[:3000],
         })
-    return data, result.trace, result.latency_ms, bool(data)
+        data = _coerce_markdown_react_reply(raw_output, user_input)
+        if data:
+            result.trace.append({
+                "type": "parse",
+                "turn": len([x for x in result.trace if x.get("type") == "llm"]),
+                "error": "",
+                "coerced_from_markdown": True,
+            })
+    return data, result.trace, result.latency_ms, json_parse_ok
 
 
 def run_recommend_react_agent(
