@@ -12,7 +12,7 @@ from backend.data.indicators import compute_market_strength_by_sector
 from backend.data.loader import compute_limit_status, compute_mas, load_daily, load_index_daily
 from backend.db.repository import get_conn
 from backend.policy.reader import extract_policy_signals
-from backend.search_agent.searcher import get_cached, get_freshness
+from backend.search_agent.searcher import get_cached, get_freshness, refresh_company_business_cache
 from backend.trading.rules import is_index_like_name, normalize_ts_code
 
 
@@ -171,10 +171,29 @@ def build_technical_snapshot(ts_code: str, days: int = 60) -> dict:
 
 
 def _business_brief(ts_code: str, max_chars: int = 520) -> tuple[str, str]:
+    name = lookup_stock_name(ts_code)
     freshness = get_freshness(ts_code)
+    if not freshness or not freshness.get("is_fresh") or freshness.get("is_bad"):
+        refresh = refresh_company_business_cache(ts_code, name)
+        if refresh.get("ok"):
+            freshness = get_freshness(ts_code)
+        else:
+            content = get_cached(ts_code)
+            if content:
+                clean = re.sub(r"#+\s*", "", content)
+                clean = re.sub(r"\n{2,}", "\n", clean).strip()
+                status = (
+                    f"可靠缓存日期 {freshness.get('date')}，刷新失败: {refresh.get('error')}"
+                    if freshness else f"缓存可用但刷新失败: {refresh.get('error')}"
+                )
+                return clean[:max_chars], status
+            return (
+                f"暂无可靠公司业务缓存；已尝试 MiniMax 刷新但失败: {refresh.get('error')}",
+                "无可靠缓存",
+            )
     content = get_cached(ts_code)
     if not content:
-        return "暂无公司业务缓存。", "无缓存"
+        return "暂无可靠公司业务缓存。", "无可靠缓存"
     clean = re.sub(r"#+\s*", "", content)
     clean = re.sub(r"\n{2,}", "\n", clean).strip()
     status = f"缓存日期 {freshness.get('date')}" if freshness else "有缓存"

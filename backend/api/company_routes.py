@@ -6,7 +6,7 @@ from datetime import datetime
 from fastapi import APIRouter
 from pydantic import BaseModel
 from backend.config import COMPANY_BUSINESS_DIR
-from backend.search_agent.searcher import is_cached, get_cached, get_freshness
+from backend.search_agent.searcher import get_cached, get_freshness
 
 router = APIRouter(prefix="/api/company", tags=["company"])
 
@@ -28,7 +28,7 @@ async def get_company_business_api(ts_code: str):
             "freshness": freshness,
             "cached": True,
         }
-    return {"ts_code": ts_code, "content": "", "cached": False, "freshness": None}
+    return {"ts_code": ts_code, "content": "", "cached": False, "freshness": get_freshness(ts_code)}
 
 
 @router.get("/business/{ts_code}/history")
@@ -51,9 +51,7 @@ async def list_business_history(ts_code: str):
 @router.post("/search")
 async def search_company_business(req: SearchRequest):
     """搜索公司业务信息（MiniMax 联网搜索 + 保存为 MD）"""
-    from backend.search_agent.searcher import save_with_date, get_cached, get_freshness
-    from backend.search_agent.minimax_search import company_business_search
-    from backend.search_agent.sector import match_sectors_from_text, extract_keywords
+    from backend.search_agent.searcher import get_cached, get_freshness, refresh_company_business_cache
 
     # 检查是否有新鲜缓存
     freshness = get_freshness(req.ts_code)
@@ -67,16 +65,10 @@ async def search_company_business(req: SearchRequest):
             "source": "cache",
         }
 
-    result = company_business_search(req.ts_code, req.name)
+    result = refresh_company_business_cache(req.ts_code, req.name)
     if not result.get("ok"):
         return {"ts_code": req.ts_code, "error": result.get("error", "MiniMax搜索失败"), "cached": False, "source": "minimax"}
-
-    llm_response = result["content"]
-    sectors = match_sectors_from_text(llm_response)
-    keywords = extract_keywords(llm_response)
-
-    # 保存带日期戳的文件
-    filepath = save_with_date(req.ts_code, req.name, llm_response, sectors, keywords)
+    llm_response = get_cached(req.ts_code) or result.get("content") or ""
     freshness = get_freshness(req.ts_code)
 
     return {
@@ -85,7 +77,7 @@ async def search_company_business(req: SearchRequest):
         "freshness": freshness,
         "cached": False,
         "source": "minimax",
-        "filepath": filepath,
+        "filepath": result.get("filepath"),
     }
 
 

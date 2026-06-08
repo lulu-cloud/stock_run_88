@@ -17,6 +17,15 @@ from backend.config import COMPANY_BUSINESS_DIR
 # 缓存有效期（天）
 CACHE_FRESH_DAYS = 30
 
+BAD_CACHE_PATTERNS = (
+    "搜索限制说明",
+    "当前网络搜索服务已达到使用限额",
+    "无法获取",
+    "未检索到明确信息",
+    "未检索到明确重大变化",
+    "暂无公司业务缓存",
+)
+
 
 def ensure_dir():
     """确保公司业务目录存在"""
@@ -33,28 +42,42 @@ def is_cached(ts_code: str) -> bool:
     return False
 
 
-def get_freshness(ts_code: str) -> Optional[dict]:
-    """获取最新缓存的新鲜度信息
+def is_bad_business_cache(content: str) -> bool:
+    """Return True when a generated MD is a quota/error placeholder, not usable research."""
+    text = str(content or "").strip()
+    if not text:
+        return True
+    if len(text) < 120:
+        return True
+    hit_count = sum(1 for pattern in BAD_CACHE_PATTERNS if pattern in text)
+    if "搜索限制" in text or "使用限额" in text:
+        return True
+    return hit_count >= 2
 
-    Returns:
-        {"filepath": str, "date": "YYYY-MM-DD", "age_days": int, "is_fresh": bool}
-        或 None（无缓存）
-    """
+
+def _cache_candidates(ts_code: str) -> list[dict]:
     if not os.path.exists(COMPANY_BUSINESS_DIR):
-        return None
-    best = None
-    best_date = ""
+        return []
+    candidates = []
     for f in os.listdir(COMPANY_BUSINESS_DIR):
-        if f.startswith(ts_code) and f.endswith(".md"):
-            date_match = re.search(r"(\d{8})", f)
-            if date_match:
-                d = date_match.group(1)
-                if d > best_date:
-                    best_date = d
-                    best = f
-    if not best:
-        return None
-    filepath = os.path.join(COMPANY_BUSINESS_DIR, best)
+        if not (f.startswith(ts_code) and f.endswith(".md")):
+            continue
+        date_match = re.search(r"(\d{8})", f)
+        d = date_match.group(1) if date_match else "00000000"
+        filepath = os.path.join(COMPANY_BUSINESS_DIR, f)
+        candidates.append({"filename": f, "filepath": filepath, "date_raw": d})
+    candidates.sort(key=lambda x: x["date_raw"], reverse=True)
+    return candidates
+
+
+def _read_file(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _freshness_from_candidate(item: dict, is_bad: bool = False) -> dict:
+    filepath = item["filepath"]
+    best_date = item.get("date_raw") or "00000000"
     try:
         file_date = datetime.strptime(best_date, "%Y%m%d")
         age_days = (datetime.now() - file_date).days
@@ -62,15 +85,42 @@ def get_freshness(ts_code: str) -> Optional[dict]:
             "filepath": filepath,
             "date": file_date.strftime("%Y-%m-%d"),
             "age_days": age_days,
-            "is_fresh": age_days <= CACHE_FRESH_DAYS,
+            "is_fresh": age_days <= CACHE_FRESH_DAYS and not is_bad,
+            "is_bad": bool(is_bad),
         }
     except ValueError:
-        return {"filepath": filepath, "date": best_date, "age_days": 999, "is_fresh": False}
+        return {"filepath": filepath, "date": best_date, "age_days": 999, "is_fresh": False, "is_bad": bool(is_bad)}
+
+
+def get_freshness(ts_code: str, include_bad: bool = False) -> Optional[dict]:
+    """获取最新缓存的新鲜度信息
+
+    Returns:
+        {"filepath": str, "date": "YYYY-MM-DD", "age_days": int, "is_fresh": bool, "is_bad": bool}
+        或 None（无缓存）
+    """
+    bad_fallback = None
+    for item in _cache_candidates(ts_code):
+        try:
+            is_bad = is_bad_business_cache(_read_file(item["filepath"]))
+        except Exception:
+            is_bad = True
+        if is_bad:
+            bad_fallback = bad_fallback or item
+            if include_bad:
+                return _freshness_from_candidate(item, True)
+            continue
+        return _freshness_from_candidate(item, False)
+    if bad_fallback:
+        return _freshness_from_candidate(bad_fallback, True)
+    return None
 
 
 def save_with_date(ts_code: str, name: str, business_md: str, sectors: list[str], keywords: list[str]) -> str:
     """保存公司业务 MD 文件（带日期戳，不覆盖旧文件）"""
     ensure_dir()
+    if is_bad_business_cache(business_md):
+        raise ValueError("公司业务内容疑似搜索限额/失败占位，拒绝写入缓存")
     datestamp = datetime.now().strftime("%Y%m%d")
     safe_name = re.sub(r"[^一-龥a-zA-Z0-9]", "_", name)[:30]
     filename = f"{ts_code}_{safe_name}_{datestamp}.md"
@@ -102,24 +152,39 @@ def save_company_business(ts_code: str, name: str, business_md: str, sectors: li
     save_with_date(ts_code, name, business_md, sectors, keywords)
 
 
-def get_cached(ts_code: str) -> Optional[str]:
+def get_cached(ts_code: str, include_bad: bool = False) -> Optional[str]:
     """获取最新的缓存 MD 内容（按日期戳取最新版本）"""
-    if not os.path.exists(COMPANY_BUSINESS_DIR):
-        return None
-    best = None
-    best_date = ""
-    for f in os.listdir(COMPANY_BUSINESS_DIR):
-        if f.startswith(ts_code) and f.endswith(".md"):
-            date_match = re.search(r"(\d{8})", f)
-            d = date_match.group(1) if date_match else "00000000"
-            if d > best_date:
-                best_date = d
-                best = f
-    if not best:
-        return None
-    filepath = os.path.join(COMPANY_BUSINESS_DIR, best)
-    with open(filepath, "r", encoding="utf-8") as f:
-        return f.read()
+    for item in _cache_candidates(ts_code):
+        content = _read_file(item["filepath"])
+        if include_bad or not is_bad_business_cache(content):
+            return content
+    return None
+
+
+def refresh_company_business_cache(ts_code: str, name: str = "") -> dict:
+    """Run MiniMax search and save a reliable company-business MD cache."""
+    from backend.search_agent.minimax_search import company_business_search
+    from backend.search_agent.sector import extract_keywords, match_sectors_from_text
+
+    result = company_business_search(ts_code, name)
+    if not result.get("ok"):
+        return {"ok": False, "error": result.get("error", "MiniMax搜索失败"), "raw": result}
+    content = result.get("content") or ""
+    if is_bad_business_cache(content):
+        return {"ok": False, "error": "MiniMax返回内容疑似搜索限额/失败占位", "raw": result}
+    sectors = match_sectors_from_text(content)
+    keywords = extract_keywords(content)
+    try:
+        filepath = save_with_date(ts_code, name, content, sectors, keywords)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "raw": result}
+    return {
+        "ok": True,
+        "content": content,
+        "filepath": filepath,
+        "freshness": get_freshness(ts_code),
+        "source": "minimax",
+    }
 
 
 def list_cached() -> list[str]:

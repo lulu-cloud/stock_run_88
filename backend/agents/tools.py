@@ -450,20 +450,31 @@ def get_company_business(ts_code: str) -> str:
     Returns:
         公司业务描述文本（含时效性说明）
     """
-    from backend.search_agent.searcher import get_freshness
+    from backend.search_agent.searcher import get_freshness, refresh_company_business_cache
+    from backend.telegram.stock_analysis import lookup_stock_name
 
     freshness = get_freshness(ts_code)
-    if freshness:
-        content = get_cached(ts_code)
-        if content:
-            if freshness["is_fresh"]:
-                return content
-            else:
+    if not freshness or not freshness.get("is_fresh") or freshness.get("is_bad"):
+        refresh = refresh_company_business_cache(ts_code, lookup_stock_name(ts_code))
+        if not refresh.get("ok"):
+            content = get_cached(ts_code)
+            if content:
                 return (
-                    f"[警告] 缓存已过时（{freshness['age_days']}天前），信息可能不准确。\n"
-                    f"建议刷新后再用于决策。\n\n"
-                    f"---\n{content}"
+                    f"[提示] 公司业务缓存超过30天或原缓存不可用；MiniMax刷新失败: {refresh.get('error')}。\n"
+                    f"以下为最近可靠缓存，仅作辅助参考。\n\n---\n{content}"
                 )
+            return f"暂无 {ts_code} 的可靠公司业务信息；MiniMax刷新失败: {refresh.get('error')}"
+        freshness = get_freshness(ts_code)
+
+    content = get_cached(ts_code)
+    if content:
+        if freshness and freshness["is_fresh"]:
+            return content
+        return (
+            f"[警告] 缓存已过时（{freshness['age_days']}天前），信息可能不准确。\n"
+            f"建议刷新后再用于决策。\n\n"
+            f"---\n{content}"
+        )
 
     return f"暂无 {ts_code} 的公司业务信息。建议联网搜索该公司主营业务后继续分析。"
 
