@@ -25,7 +25,8 @@ def generate_daily_report(agent_id: int, agent_name: str, trade_date: str,
                           decision: AgentDecision | None = None,
                           daily_pnl: float = 0.0,
                           daily_return: float = 0.0,
-                          cumulative_pnl: float = 0.0) -> str:
+                          cumulative_pnl: float = 0.0,
+                          review_error: str = "") -> str:
     """生成每日 Markdown 复盘文档
 
     Returns:
@@ -66,6 +67,11 @@ def generate_daily_report(agent_id: int, agent_name: str, trade_date: str,
                 f"{float(o.get('skill_confidence') or 0):.2f} | {o.get('reason', '')} |\n"
             )
     no_action_note = _no_action_note(trades, decision)
+    if review_error and not (trades or (decision and decision.orders)):
+        no_action_note = (
+            f"本轮没有成交、没有新条件单。复盘异常: {review_error}。"
+            "若 thinking.log 中存在候选或完整 JSON，系统会写入 Idea Pool 做后验观察。"
+        )
     evolution_md = ""
     evo = context.evolution_context or {}
     for skill in (evo.get("skills") or [])[:6]:
@@ -111,7 +117,7 @@ def generate_daily_report(agent_id: int, agent_name: str, trade_date: str,
 
 ## 4. 操作总结
 
-{decision.market_analysis if decision else 'Agent 未生成分析。'}
+{decision.market_analysis if decision else ('Agent 未生成分析。' + (f' 复盘异常: {review_error}' if review_error else ''))}
 
 {('### 无操作说明\n\n' + no_action_note) if no_action_note else ''}
 
@@ -123,7 +129,7 @@ def generate_daily_report(agent_id: int, agent_name: str, trade_date: str,
 
 ## 6. 风险评估
 
-{decision.risk_assessment if decision else '无'}
+{decision.risk_assessment if decision else (f'复盘异常: {review_error}' if review_error else '无')}
 
 ## 7. 进化技能快照
 

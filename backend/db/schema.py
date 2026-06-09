@@ -189,6 +189,52 @@ CREATE TABLE IF NOT EXISTS agent_daily_report (
     UNIQUE(agent_id, trade_date)
 );
 
+CREATE TABLE IF NOT EXISTS agent_idea_pool (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id        INTEGER NOT NULL REFERENCES agent_info(id),
+    trade_date      TEXT NOT NULL,
+    ts_code         TEXT NOT NULL,
+    stock_name      TEXT,
+    source          TEXT DEFAULT 'selected',
+    score           REAL,
+    reason          TEXT,
+    status          TEXT DEFAULT 'candidate',
+    reject_reason   TEXT DEFAULT '',
+    discovery_price REAL DEFAULT 0.0,
+    market_context_json TEXT DEFAULT '{}',
+    raw_json        TEXT DEFAULT '{}',
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now')),
+    UNIQUE(agent_id, trade_date, ts_code, source)
+);
+
+CREATE TABLE IF NOT EXISTS agent_idea_outcome (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    idea_id         INTEGER NOT NULL REFERENCES agent_idea_pool(id),
+    ts_code         TEXT NOT NULL,
+    base_trade_date TEXT,
+    base_price      REAL DEFAULT 0.0,
+    return_1d       REAL,
+    return_3d       REAL,
+    return_5d       REAL,
+    return_10d      REAL,
+    return_20d      REAL,
+    benchmark_return_1d REAL,
+    benchmark_return_3d REAL,
+    benchmark_return_5d REAL,
+    benchmark_return_10d REAL,
+    benchmark_return_20d REAL,
+    beat_benchmark_1d INTEGER,
+    beat_benchmark_3d INTEGER,
+    beat_benchmark_5d INTEGER,
+    beat_benchmark_10d INTEGER,
+    beat_benchmark_20d INTEGER,
+    max_adverse_excursion REAL DEFAULT 0.0,
+    status          TEXT DEFAULT 'pending',
+    updated_at      TEXT DEFAULT (datetime('now')),
+    UNIQUE(idea_id)
+);
+
 CREATE TABLE IF NOT EXISTS strategy_repository (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT NOT NULL,
@@ -209,6 +255,9 @@ CREATE INDEX IF NOT EXISTS idx_order_trace_order ON agent_order_trace(order_id, 
 CREATE INDEX IF NOT EXISTS idx_order_trace_agent ON agent_order_trace(agent_id, trade_date, created_at);
 CREATE INDEX IF NOT EXISTS idx_decision_batch_agent ON agent_decision_batch(agent_id, trade_date);
 CREATE INDEX IF NOT EXISTS idx_shared_context_date ON agent_shared_context(trade_date, agent_id);
+CREATE INDEX IF NOT EXISTS idx_agent_idea_agent ON agent_idea_pool(agent_id, trade_date);
+CREATE INDEX IF NOT EXISTS idx_agent_idea_status ON agent_idea_pool(status, trade_date);
+CREATE INDEX IF NOT EXISTS idx_agent_idea_outcome ON agent_idea_outcome(idea_id, status);
 
 CREATE TABLE IF NOT EXISTS macro_daily_report (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,

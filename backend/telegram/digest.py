@@ -1,5 +1,8 @@
 """Daily Telegram digest generation."""
 
+import os
+import re
+
 from backend.data.indicators import compute_market_strength_by_sector
 from backend.data.loader import load_index_daily
 from backend.db.repository import get_conn
@@ -31,6 +34,46 @@ def _truncate(text: str, limit: int = 3800) -> str:
 
 def _fmt_money(value) -> str:
     return f"{float(value or 0):,.2f}"
+
+
+def _section(text: str, heading: str, limit: int = 700) -> str:
+    if not text or heading not in text:
+        return ""
+    start = text.find(heading) + len(heading)
+    rest = text[start:]
+    match = re.search(r"\n##\s+\d+\.|\n###\s+", rest)
+    body = rest[:match.start()] if match else rest
+    body = body.strip()
+    return body[:limit].rstrip()
+
+
+def _agent_no_action_reason(agent_id: int, trade_date: str) -> str:
+    conn = get_conn()
+    row = conn.execute(
+        """SELECT report_md_path FROM agent_daily_report
+           WHERE agent_id=? AND trade_date=?""",
+        (agent_id, trade_date),
+    ).fetchone()
+    conn.close()
+    path = row["report_md_path"] if row else ""
+    if not path or not os.path.exists(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        return ""
+    no_action = _section(content, "### 无操作说明", 700)
+    risk = _section(content, "## 6. 风险评估", 700)
+    summary = _section(content, "## 4. 操作总结", 700)
+    lines = []
+    if no_action:
+        lines.append(no_action)
+    elif risk and risk != "无":
+        lines.append(risk)
+    elif summary and "Agent 未生成分析" not in summary:
+        lines.append(summary)
+    return "\n".join(lines).strip()
 
 
 def _agent_asset_table_md(agent_id: int, trade_date: str) -> str:
@@ -79,6 +122,9 @@ def _agent_orders_md(agent_id: int, trade_date: str) -> str:
     ).fetchall()
     conn.close()
     if not rows:
+        reason = _agent_no_action_reason(agent_id, trade_date)
+        if reason:
+            return "无待触发预操作单\n\n*空仓/无单理由*\n" + reason
         return "无待触发预操作单"
 
     lines = []

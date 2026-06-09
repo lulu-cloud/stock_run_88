@@ -20,7 +20,13 @@ from backend.db.repository import (
 from backend.data.loader import load_daily, load_index_daily
 from backend.trading.calculator import calc_total_assets, calc_cumulative_return
 from backend.trading.rules import match_order_price, calc_buy_fee, calc_sell_fee, can_trade_today, normalize_ts_code
-from backend.agents.base import AgentContext
+from backend.agents.base import AgentContext, AgentDecision
+from backend.agents.idea_pool import (
+    extract_trade_plan_from_text,
+    idea_candidates_from_decision,
+    upsert_agent_ideas,
+    update_agent_idea_outcomes,
+)
 from backend.agents.llm_agent import run_agent_review
 from backend.agents.tools import filter_tools_by_names
 from backend.pipeline.order_executor import execute_orders
@@ -85,6 +91,9 @@ def run_agent_review_with_timeout(agent_id: int, agent_name: str, context: Agent
     if proc.is_alive():
         proc.terminate()
         proc.join(5)
+        recovered = _recover_decision_from_thinking_log(agent_id, agent_name, context, thinking_log_path)
+        if recovered:
+            return recovered, f"Agent review timed out after {AGENT_REVIEW_TIMEOUT_SECONDS}s; recovered final JSON from thinking log"
         return None, f"Agent review timed out after {AGENT_REVIEW_TIMEOUT_SECONDS}s"
     if queue.empty():
         return None, "Agent review exited without result"
@@ -92,6 +101,36 @@ def run_agent_review_with_timeout(agent_id: int, agent_name: str, context: Agent
     if payload.get("ok"):
         return payload.get("decision"), ""
     return None, payload.get("error", "Agent review failed")
+
+
+def _recover_decision_from_thinking_log(
+    agent_id: int,
+    agent_name: str,
+    context: AgentContext,
+    thinking_log_path: str,
+) -> AgentDecision | None:
+    if not thinking_log_path or not os.path.exists(thinking_log_path):
+        return None
+    try:
+        with open(thinking_log_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        return None
+    plan = extract_trade_plan_from_text(content[-50000:])
+    if not plan:
+        return None
+    if "orders" not in plan:
+        return None
+    return AgentDecision(
+        agent_id=agent_id,
+        trade_date=context.trade_date,
+        analysis=content[-12000:],
+        selected_stocks=plan.get("selected_stocks", []) if isinstance(plan.get("selected_stocks"), list) else [],
+        orders=plan.get("orders", []) if isinstance(plan.get("orders"), list) else [],
+        market_analysis=str(plan.get("market_analysis") or ""),
+        risk_assessment=str(plan.get("risk_assessment") or f"复盘超时后从 thinking.log 恢复完整 JSON。Agent: {agent_name}"),
+        tool_trace=[{"type": "timeout_recovery", "source": "thinking_log", "recovered": True}],
+    )
 
 
 def _infer_market_regime(text: str) -> str:
@@ -184,6 +223,52 @@ def _upsert_shared_context(conn: sqlite3.Connection, agent_id: int, trade_date: 
         ),
     )
     return row
+
+
+def _record_agent_ideas_from_decision(
+    conn: sqlite3.Connection,
+    agent_id: int,
+    trade_date: str,
+    decision: AgentDecision | None,
+    *,
+    review_error: str = "",
+    thinking_log_path: str = "",
+) -> int:
+    candidates = idea_candidates_from_decision(decision) if decision else []
+    if not candidates and review_error and thinking_log_path and os.path.exists(thinking_log_path):
+        try:
+            with open(thinking_log_path, "r", encoding="utf-8") as f:
+                plan = extract_trade_plan_from_text(f.read()[-50000:])
+            if plan:
+                recovered = AgentDecision(
+                    agent_id=agent_id,
+                    trade_date=trade_date,
+                    selected_stocks=plan.get("selected_stocks", []) if isinstance(plan.get("selected_stocks"), list) else [],
+                    orders=plan.get("orders", []) if isinstance(plan.get("orders"), list) else [],
+                    market_analysis=str(plan.get("market_analysis") or ""),
+                    risk_assessment=str(plan.get("risk_assessment") or ""),
+                )
+                candidates = idea_candidates_from_decision(recovered, "timeout_log")
+        except Exception:
+            candidates = []
+    market_context = {}
+    if decision:
+        market_context = {
+            "market_analysis": (decision.market_analysis or "")[:1200],
+            "risk_assessment": (decision.risk_assessment or "")[:1200],
+            "review_error": review_error,
+        }
+    elif review_error:
+        market_context = {"review_error": review_error}
+    return upsert_agent_ideas(
+        conn,
+        agent_id,
+        trade_date,
+        candidates,
+        market_context=market_context,
+        default_status="candidate",
+        reject_reason=review_error if review_error and not decision else "",
+    )
 
 
 def _record_cross_agent_order_conflicts(conn: sqlite3.Connection, trade_date: str) -> int:
@@ -1386,6 +1471,7 @@ def run_daily_pipeline(trade_date: str = None, agent_ids: list[int] | None = Non
 
         thinking_log_path = f"logs/{trade_date}/{agent['name']}/thinking.log"
         risk_cfg = {}
+        review_error = ""
         try:
             risk_cfg = json.loads(agent.get("risk_config", "{}"))
             reasoning_effort = risk_cfg.get("reasoning_effort", "high")
@@ -1422,6 +1508,7 @@ def run_daily_pipeline(trade_date: str = None, agent_ids: list[int] | None = Non
         except Exception as e:
             decision = None
             decision_latency_ms = 0.0
+            review_error = str(e)
             print(f"Agent {agent_name} LLM call failed: {e}")
             if fail_fast:
                 raise
@@ -1430,10 +1517,25 @@ def run_daily_pipeline(trade_date: str = None, agent_ids: list[int] | None = Non
             shared_context = _upsert_shared_context(conn, agent_id, trade_date, decision)
             invalid_orders = _validate_decision_order_prices(agent_id, decision, next_order_date, risk_cfg, conn)
             if invalid_orders:
-                raise ValueError(f"Agent {agent_name} generated invalid order prices: {invalid_orders}")
-            _release_pending_orders(agent_id, next_order_date, conn, "新复盘替换旧预操作单")
+                if "recovered final JSON" in (review_error or ""):
+                    review_error = f"{review_error}; recovered JSON order validation failed: {invalid_orders}"
+                    decision = None
+                    shared_context = None
+                else:
+                    raise ValueError(f"Agent {agent_name} generated invalid order prices: {invalid_orders}")
+            if decision:
+                _release_pending_orders(agent_id, next_order_date, conn, "新复盘替换旧预操作单")
         else:
             shared_context = None
+
+        idea_count = _record_agent_ideas_from_decision(
+            conn,
+            agent_id,
+            trade_date,
+            decision,
+            review_error=review_error,
+            thinking_log_path=thinking_log_path,
+        )
 
         if decision and decision.orders:
             decision_batch_id = f"{agent_id}-{trade_date}-{int(time.time())}"
@@ -1550,6 +1652,7 @@ def run_daily_pipeline(trade_date: str = None, agent_ids: list[int] | None = Non
         report_path = generate_daily_report(
             agent_id, agent_name, trade_date, context, trades, decision,
             daily_pnl=daily_pnl, daily_return=daily_return, cumulative_pnl=cumulative_pnl,
+            review_error=review_error,
         )
 
         conn.execute(
@@ -1602,6 +1705,7 @@ def run_daily_pipeline(trade_date: str = None, agent_ids: list[int] | None = Non
             "trades": len(trades),
             "next_order_date": next_order_date,
             "new_orders": len(decision.orders) if decision and decision.orders else 0,
+            "ideas": idea_count,
             "total_assets": total_assets,
             "cumulative_return": cumulative_return,
             "positions": len(positions),
@@ -1619,6 +1723,10 @@ def run_daily_pipeline(trade_date: str = None, agent_ids: list[int] | None = Non
             "policy": "warn_only",
             "trade_date": next_order_date,
         }
+    try:
+        results["_idea_outcomes"] = update_agent_idea_outcomes(conn, 300)
+    except Exception as idea_error:
+        results["_idea_outcomes"] = {"error": str(idea_error)}
     conn.commit()
     conn.close()
     return results

@@ -299,6 +299,50 @@
       </table>
     </div>
 
+    <div v-if="activeTab === 'ideas'" class="card" style="margin-bottom:16px;">
+      <div class="card-header-row">
+        <h3>发现池 / 观察仓</h3>
+        <div class="tool-actions">
+          <button class="btn btn-sm" @click="refreshIdeaOutcomes">刷新后验</button>
+          <button class="btn btn-sm" @click="loadIdeas">刷新</button>
+        </div>
+      </div>
+      <div class="eval-help">
+        这里评估 Agent 的“发现机会能力”，不等同真实交易收益。候选可能来自 selected_stocks、最终订单、或超时日志中可解析出的完整交易计划。
+      </div>
+      <div class="eval-metric-cards">
+        <div class="eval-metric-card">
+          <span class="slabel">候选数</span><strong>{{ ideaSummary.idea_count || 0 }}</strong>
+        </div>
+        <div class="eval-metric-card">
+          <span class="slabel">已评估T+5</span><strong>{{ ideaSummary.evaluated_5d || 0 }}</strong>
+        </div>
+        <div class="eval-metric-card">
+          <span class="slabel">T+5平均收益</span><strong>{{ pct(ideaSummary.avg_return_5d) }}</strong>
+        </div>
+        <div class="eval-metric-card">
+          <span class="slabel">T+5跑赢率</span><strong>{{ pct(ideaSummary.beat_benchmark_5d_rate) }}</strong>
+        </div>
+      </div>
+      <table>
+        <thead><tr><th>日期</th><th>股票</th><th>来源</th><th>状态</th><th>发现价</th><th>T+1</th><th>T+5</th><th>T+20</th><th>理由</th></tr></thead>
+        <tbody>
+          <tr v-for="item in ideaItems" :key="item.id">
+            <td class="mono">{{ item.trade_date }}</td>
+            <td><span class="mono">{{ item.ts_code }}</span><span v-if="item.stock_name" class="stock-name">{{ item.stock_name }}</span></td>
+            <td>{{ ideaSourceLabel(item.source) }}</td>
+            <td>{{ ideaStatusLabel(item.status) }}</td>
+            <td class="mono">{{ num(item.discovery_price) }}</td>
+            <td class="mono" :class="returnClass(item.return_1d)">{{ pct(item.return_1d) }}</td>
+            <td class="mono" :class="returnClass(item.return_5d)">{{ pct(item.return_5d) }}</td>
+            <td class="mono" :class="returnClass(item.return_20d)">{{ pct(item.return_20d) }}</td>
+            <td class="batch-summary">{{ item.reason || item.reject_reason || '-' }}</td>
+          </tr>
+          <tr v-if="!ideaItems.length"><td colspan="9" class="empty-row">暂无发现池记录。新复盘会自动写入候选。</td></tr>
+        </tbody>
+      </table>
+    </div>
+
     <div v-if="activeTab === 'ordertrace'" class="card" style="margin-bottom:16px;">
       <div class="card-header-row">
         <h3>决策批次</h3>
@@ -463,6 +507,8 @@ const systemDoc = ref({})
 const promptPreview = ref({})
 const evalItems = ref([])
 const costItems = ref([])
+const ideaItems = ref([])
+const ideaSummary = ref({})
 const latestEval = computed(() => evalItems.value[0] || agent.value?.eval_summary || {})
 const evalMetricDefs = [
   { key: 'total_tokens', label: 'Token', mode: 'sum', decimals: 0, suffix: '' },
@@ -491,6 +537,7 @@ const tabs = [
   { key: 'evolution', label: '进化记忆' },
   { key: 'prompt', label: '提示词预览' },
   { key: 'eval', label: '评估指标' },
+  { key: 'ideas', label: '发现池' },
   { key: 'ordertrace', label: '订单 Trace' },
 ]
 const statusForm = ref({ status: 'active' })
@@ -583,6 +630,28 @@ function formatMetric(value, def) {
 function formatChange(value) {
   if (!Number.isFinite(value)) return '-'
   return `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`
+}
+function returnClass(value) {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return ''
+  return n >= 0 ? 'green' : 'red'
+}
+function ideaSourceLabel(source) {
+  return ({
+    selected: '选股候选',
+    order: '交易计划',
+    timeout_log: '超时日志',
+  })[source] || source || '-'
+}
+function ideaStatusLabel(status) {
+  return ({
+    candidate: '候选',
+    watchlist: '观察',
+    promoted: '已提升为计划',
+    rejected: '未采纳',
+    traded: '已交易',
+    expired: '过期',
+  })[status] || status || '-'
 }
 async function showLogic(kind, item) {
   logicPanel.value = {
@@ -792,6 +861,8 @@ function resetLazyTabData() {
   promptPreview.value = {}
   evalItems.value = []
   costItems.value = []
+  ideaItems.value = []
+  ideaSummary.value = {}
   orderTraceItems.value = []
   decisionBatches.value = []
 }
@@ -801,6 +872,7 @@ async function loadActiveTabData() {
   if (activeTab.value === 'evolution') return loadEvolution()
   if (activeTab.value === 'prompt') return loadPromptPreview()
   if (activeTab.value === 'eval') return loadEval()
+  if (activeTab.value === 'ideas') return loadIdeas()
   if (activeTab.value === 'ordertrace') return loadOrderTrace()
 }
 
@@ -828,6 +900,24 @@ async function loadEval() {
     evalItems.value = ev.data.items || []
     costItems.value = cost.data.items || []
   } catch (e) {}
+}
+
+async function loadIdeas() {
+  const id = route.params.id
+  if (!id || id === 'undefined') return
+  try {
+    const res = await agentAPI.ideas(id, 90)
+    ideaItems.value = res.data.items || []
+    ideaSummary.value = res.data.summary || {}
+  } catch (e) {
+    ideaItems.value = []
+    ideaSummary.value = {}
+  }
+}
+
+async function refreshIdeaOutcomes() {
+  await agentAPI.updateIdeaOutcomes(300)
+  await loadIdeas()
 }
 
 async function loadOrderTrace() {

@@ -25,6 +25,7 @@ from backend.evolution.reflection import (
     run_reflection_task,
 )
 from backend.agents.llm_agent import AGENT_SYSTEM_PROMPT
+from backend.agents.idea_pool import idea_summary, list_agent_ideas, update_agent_idea_outcomes
 from backend.evolution.engine import format_evolution_prompt, prepare_evolution_context
 from backend.evaluation import latest_agent_eval, list_agent_cost, list_agent_eval
 
@@ -239,6 +240,7 @@ async def get_agent_detail(agent_id: int):
         (agent_id,),
     ).fetchone()
     eval_summary = latest_agent_eval(conn, agent_id)
+    discovery_summary = idea_summary(conn, agent_id, 90)
     skills = [dict(r) for r in conn.execute(
         "SELECT skill_id, skill_name, confidence_score, recent_fail_rate, evolution_record FROM agent_evolution_skill WHERE agent_id=? AND enabled=1 ORDER BY confidence_score DESC",
         (agent_id,),
@@ -321,6 +323,7 @@ async def get_agent_detail(agent_id: int):
             "race_metric": dict(race) if race else {},
             "capital_policy": dict(policy) if policy else {},
             "eval_summary": eval_summary,
+            "idea_summary": discovery_summary,
             "skills": skills,
             "stock_pool": stock_pool,
             "strategy_versions": AgentManager.list_user_strategy_versions(agent_id, 20),
@@ -438,6 +441,37 @@ async def get_agent_cost(agent_id: int, days: int = Query(30, description="返�
     data = list_agent_cost(conn, agent_id, days)
     conn.close()
     return {"items": data}
+
+
+@router.get("/{agent_id}/ideas")
+async def get_agent_ideas(
+    agent_id: int,
+    days: int = Query(30, description="返回天数"),
+    status: str = Query("", description="candidate/watchlist/promoted/rejected/traded/expired"),
+):
+    conn = get_conn()
+    data = list_agent_ideas(conn, agent_id, days, status)
+    summary = idea_summary(conn, agent_id, days)
+    conn.close()
+    return {"items": data, "summary": summary}
+
+
+@router.get("/{agent_id}/idea-outcomes")
+async def get_agent_idea_outcomes(agent_id: int, days: int = Query(90, description="返回天数")):
+    conn = get_conn()
+    data = list_agent_ideas(conn, agent_id, days)
+    summary = idea_summary(conn, agent_id, days)
+    conn.close()
+    return {"items": data, "summary": summary}
+
+
+@router.post("/ideas/outcome/update")
+async def update_agent_ideas_outcome(limit: int = Query(300)):
+    conn = get_conn()
+    result = update_agent_idea_outcomes(conn, limit)
+    conn.commit()
+    conn.close()
+    return result
 
 
 @router.get("/{agent_id}/prompt-preview")
