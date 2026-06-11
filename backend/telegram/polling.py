@@ -89,6 +89,7 @@ class _TelegramProgress:
                 "followup": "上下文追问",
                 "position_advice": "持仓处置",
                 "identity": "身份介绍",
+                "partnership_account": "合伙账户",
                 "chat": "普通对话",
             }
             return f"🎯 识别意图: {labels.get(intent, intent)}"
@@ -191,6 +192,11 @@ class _TelegramProgress:
             "recommend_find_ma_bullish_pullback": "筛选多头均线发散且回踩均线的股票。",
             "recommend_get_policy_preference": "读取近期政策偏好的产业方向。",
             "recommend_record_stock_interest": "记录用户提及或推荐过的股票，沉淀共享研究报告。",
+            "partnership_account_tool": "管理合伙股票账户，计算每日盈亏分配、权益和历史记录。",
+            "partnership_init_account_tool": "初始化两人合伙股票账户。",
+            "partnership_daily_report_tool": "上报合伙账户总资产和出入金，并按昨日权益比例分配盈亏。",
+            "partnership_status_tool": "查询合伙账户当前权益和累计盈亏。",
+            "partnership_history_tool": "查询合伙账户最近分成历史。",
         }
         return descriptions.get(str(tool_name or ""), "")
 

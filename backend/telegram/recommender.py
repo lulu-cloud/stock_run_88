@@ -61,6 +61,14 @@ from backend.telegram.knowledge import (
 )
 from backend.telegram.evaluation import record_recommend_eval
 from backend.data.loader import load_daily
+from backend.telegram.partnership_account import (
+    dispatch_partnership_command,
+    is_partnership_account_message,
+    partnership_daily_report,
+    partnership_history,
+    partnership_init_account,
+    partnership_status,
+)
 
 
 RECOMMEND_DAILY_LIMIT = 20
@@ -170,6 +178,8 @@ def _guess_intent(text: str) -> str:
         return "backtest"
     if lower.startswith(("/intraday", "/alert")) or any(token in raw for token in ("盘中提醒", "盘中检查", "盘中异动")):
         return "intraday"
+    if is_partnership_account_message(raw):
+        return "partnership_account"
     if lower.startswith(("/analyze", "analyze", "分析", "看看", "问问")) or any(
         token in raw for token in ("如何看", "怎么看", "点评", "评价", "分析下")
     ):
@@ -1325,6 +1335,30 @@ def recommend_record_feedback(chat_id: str, feedback_type: str, text: str = "") 
     return json.dumps({"ok": ok, "feedback_type": feedback_type}, ensure_ascii=False)
 
 
+@tool
+def partnership_init_account_tool(command_text: str) -> str:
+    """初始化两人合伙股票账户；必须传入完整 /init 文本或自然语言初始化文本。"""
+    return partnership_init_account(command_text)
+
+
+@tool
+def partnership_daily_report_tool(command_text: str) -> str:
+    """上报合伙账户今日总资产和双方出入金，并按昨日权益比例分配当日盈亏。"""
+    return partnership_daily_report(command_text)
+
+
+@tool
+def partnership_status_tool() -> str:
+    """查询合伙账户每个参与人的当前权益、累计净投入和累计盈亏。"""
+    return partnership_status()
+
+
+@tool
+def partnership_history_tool(limit: int = 7) -> str:
+    """查询合伙账户最近 N 天每日分成明细。"""
+    return partnership_history(int(limit or 7))
+
+
 RECOMMEND_TOOLS = [
     recommend_search_stocks,
     recommend_analyze_stock,
@@ -1346,19 +1380,24 @@ RECOMMEND_TOOLS = [
     recommend_get_shared_stock_report,
     recommend_get_identity,
     recommend_record_feedback,
+    partnership_init_account_tool,
+    partnership_daily_report_tool,
+    partnership_status_tool,
+    partnership_history_tool,
 ]
 
 
 RECOMMEND_SYSTEM_PROMPT = """你是股票推荐助手，使用 ReAct 工具循环回答 Telegram 用户。
 
 要求：
-- 先识别 intent：recommend/analyze/position_advice/compare/ma_check/price_volume/policy/profile/watchlist/identity/followup/backtest/intraday/feedback/help。
+- 先识别 intent：recommend/analyze/position_advice/compare/ma_check/price_volume/policy/profile/watchlist/identity/followup/backtest/intraday/feedback/partnership_account/help。
 - 输入 JSON 里 memory_context 已按层分开：short_term_messages 是最近 5-8 轮短期上下文，session_summary 是当前会话中期摘要，long_term_memories 是 user/chat/thread/global 长期画像。回答时优先遵守当前用户记忆，不要把群聊其他人的偏好当成当前用户偏好。
 - 用户说“上次推荐的那只/刚才那几个/继续看”时，优先结合 memory_context 中最近推荐标的和上下文回答，不能当成全新无上下文问题。
 - 用户围绕上一只股票继续说“重仓/均价/亏损/清仓/割肉/止损/减仓/怎么办”时，这是 position_advice，不是选股请求；必须结合 short_term_messages 里的上一只股票和用户成本回答，recommendations 可以为空。
 - 推荐股票时必须调用 recommend_get_user_profile(chat_id,user_id) 和 recommend_get_trader_memory；通常还要调用 recommend_search_stocks。
 - 对最终推荐中的主要标的至少抽样调用 recommend_analyze_stock 或 recommend_compare_stocks 获取证据。
 - 用户问“是否多头均线发散”时调用 recommend_check_ma_bullish；问“最近十天价格与量趋势”时调用 recommend_price_volume_trend。
+- 用户使用 /init、/daily、/status、/history 或询问合伙账户/分成/权益时，必须调用 partnership_* 工具；禁止自行计算账户盈亏、权益和分配。
 - 用户问“政策偏好/国家政策”时调用 recommend_get_policy_preference；问“你是谁”时调用 recommend_get_identity。
 - 用户问“今天龙虎榜/北向资金/沪深港通资金/涨停板/涨停质量/板质量/封板质量/晋级率/跌停板/炸板/强势股池/板块热度”时调用 recommend_get_market_topic。
 - 用户问“筹码峰/筹码分布”时调用 recommend_get_stock_chip_distribution；问“最新业绩预告/业绩快报/基本面事件”时调用 recommend_get_stock_fundamental_events。
@@ -1862,12 +1901,34 @@ def _handle_text_message_inner(
             "/intraday 盘中检查关注股、板块和待触发条件单\n"
             "/backtest ma_bullish_pullback 1m\n"
             "/memory 查看记忆 / /memory forget 关键词\n"
+            "/init xulu hsw 150000 100000 初始化合伙账户\n"
+            "/daily 256000 0 5000 上报合伙账户今日总资产和出入金\n"
+            "/history 查看最近7天合伙账户分成记录\n"
             "/login 获取看板登录验证码 / /whoami 查看 Telegram 身份\n"
-            "/status 1\n"
+            "/status 查看合伙账户状态，/status 1 查看交易员战绩\n"
             "/sim 1\n"
             "/bind 1\n"
             "也可以直接发自然语言选股需求。"
         )
+
+    if is_partnership_account_message(raw):
+        if progress_callback:
+            progress_callback({
+                "type": "tool_start",
+                "tool": "partnership_account_tool",
+                "description": "解析合伙账户命令，并通过 SQLite 工具完成初始化、每日分成、状态或历史查询。",
+                "args": {"command": raw[:120]},
+            })
+        reply = dispatch_partnership_command(raw)
+        if progress_callback:
+            progress_callback({
+                "type": "tool",
+                "tool": "partnership_account_tool",
+                "description": "解析合伙账户命令，并通过 SQLite 工具完成初始化、每日分成、状态或历史查询。",
+                "args": {},
+                "result_preview": reply[:180],
+            })
+        return reply
 
     if lower.startswith("/memory") or raw.startswith("记忆"):
         if "forget" in lower or "删除" in raw or "忘记" in raw:

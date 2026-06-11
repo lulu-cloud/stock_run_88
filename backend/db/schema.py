@@ -518,6 +518,25 @@ CREATE TABLE IF NOT EXISTS telegram_recommend_cost (
     created_at      TEXT DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS account (
+    last_total_asset REAL,
+    last_date        TEXT
+);
+
+CREATE TABLE IF NOT EXISTS participants (
+    name       TEXT PRIMARY KEY,
+    equity     REAL,
+    net_invest REAL
+);
+
+CREATE TABLE IF NOT EXISTS daily_history (
+    date        TEXT PRIMARY KEY,
+    total_asset REAL,
+    daily_pnl   REAL,
+    cash_flows  TEXT,
+    allocation  TEXT
+);
+
 CREATE TABLE IF NOT EXISTS shared_stock_report (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     ts_code         TEXT NOT NULL,
