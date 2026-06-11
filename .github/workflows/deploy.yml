@@ -52,4 +52,10 @@ jobs:
             npm ci --include=dev
             npm run build
             cd ..
-            sudo systemctl restart stock-run-api
+            sudo timeout 20 systemctl stop stock-run-api || true
+            sudo systemctl kill stock-run-api || true
+            sudo pkill -9 -f "uvicorn backend.main:app" || true
+            sudo systemctl reset-failed stock-run-api || true
+            sudo systemctl start stock-run-api
+            sleep 5
+            systemctl is-active --quiet stock-run-api
