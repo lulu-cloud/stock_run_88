@@ -28,8 +28,21 @@ from backend.agents.llm_agent import AGENT_SYSTEM_PROMPT
 from backend.agents.idea_pool import idea_summary, list_agent_ideas, update_agent_idea_outcomes
 from backend.evolution.engine import format_evolution_prompt, prepare_evolution_context
 from backend.evaluation import latest_agent_eval, list_agent_cost, list_agent_eval
+from backend.cache import cached, invalidate
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
+
+READ_TTL = 300
+DETAIL_TTL = 180
+
+
+def _invalidate_agent_cache(agent_id: int | None = None):
+    invalidate("agent:")
+    if agent_id is not None:
+        invalidate(f"agent_detail:{agent_id}:")
+        invalidate(f"agent_eval:{agent_id}:")
+        invalidate(f"agent_cost:{agent_id}:")
+        invalidate(f"agent_ideas:{agent_id}:")
 
 
 class CreateAgentRequest(BaseModel):
@@ -70,6 +83,10 @@ class ScheduleRequest(BaseModel):
 @router.get("/list")
 async def list_agents_api():
     """获取所有 Agent 列表"""
+    return cached("agent:list", READ_TTL, _list_agents_payload)
+
+
+def _list_agents_payload():
     agents = AgentManager.list_all()
     result = []
     conn = get_conn()
@@ -124,6 +141,10 @@ async def list_agents_api():
 
 @router.get("/race")
 async def agent_race_panel(days: int = Query(90, description="对比天数")):
+    return cached(f"agent:race:{int(days or 90)}", READ_TTL, lambda: _agent_race_panel_payload(days))
+
+
+def _agent_race_panel_payload(days: int):
     conn = get_conn()
     data = latest_race_panel(conn, days)
     conn.close()
@@ -147,6 +168,10 @@ async def agent_tool_catalog():
 @router.get("/comparison")
 async def agent_comparison(days: int = Query(90, description="对比天数")):
     """获取所有 Agent 的绩效对比数据（净值曲线 + 每日盈亏）"""
+    return cached(f"agent:comparison:{int(days or 90)}", READ_TTL, lambda: _agent_comparison_payload(days))
+
+
+def _agent_comparison_payload(days: int):
     conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT id, display_name, agent_type, initial_capital FROM agent_info ORDER BY id")
@@ -180,6 +205,10 @@ async def agent_comparison(days: int = Query(90, description="对比天数")):
 @router.get("/positions")
 async def agent_positions_overview():
     """获取每个 Agent 的仓位和个股权重。"""
+    return cached("agent:positions", READ_TTL, _agent_positions_payload)
+
+
+def _agent_positions_payload():
     conn = get_conn()
     rows = conn.execute("SELECT id, display_name, current_cash, initial_capital FROM agent_info ORDER BY id").fetchall()
     agents = []
@@ -218,6 +247,10 @@ async def agent_positions_overview():
 @router.get("/{agent_id}")
 async def get_agent_detail(agent_id: int):
     """获取 Agent 详情"""
+    return cached(f"agent_detail:{agent_id}:v1", DETAIL_TTL, lambda: _agent_detail_payload(agent_id))
+
+
+def _agent_detail_payload(agent_id: int):
     agent = AgentManager.get(agent_id)
     if not agent:
         return {"error": "Agent not found"}
@@ -398,6 +431,11 @@ async def get_agent_detail(agent_id: int):
 
 @router.get("/{agent_id}/orders/trace")
 async def get_agent_order_trace(agent_id: int, order_id: int | None = Query(default=None), limit: int = Query(80)):
+    key = f"agent:order_trace:{agent_id}:{order_id or ''}:{int(limit or 80)}"
+    return cached(key, READ_TTL, lambda: _agent_order_trace_payload(agent_id, order_id, limit))
+
+
+def _agent_order_trace_payload(agent_id: int, order_id: int | None, limit: int):
     conn = get_conn()
     if order_id:
         data = list_order_trace(order_id, conn)
@@ -409,6 +447,11 @@ async def get_agent_order_trace(agent_id: int, order_id: int | None = Query(defa
 
 @router.get("/{agent_id}/decision-batches")
 async def get_agent_decision_batches(agent_id: int, limit: int = Query(30)):
+    key = f"agent:decision_batches:{agent_id}:{int(limit or 30)}"
+    return cached(key, READ_TTL, lambda: _agent_decision_batches_payload(agent_id, limit))
+
+
+def _agent_decision_batches_payload(agent_id: int, limit: int):
     conn = get_conn()
     rows = conn.execute(
         """SELECT b.*,
@@ -429,6 +472,10 @@ async def get_agent_decision_batches(agent_id: int, limit: int = Query(30)):
 
 @router.get("/{agent_id}/eval")
 async def get_agent_eval(agent_id: int, days: int = Query(90, description="返回天数")):
+    return cached(f"agent_eval:{agent_id}:{int(days or 90)}", READ_TTL, lambda: _agent_eval_payload(agent_id, days))
+
+
+def _agent_eval_payload(agent_id: int, days: int):
     conn = get_conn()
     data = list_agent_eval(conn, agent_id, days)
     conn.close()
@@ -437,6 +484,10 @@ async def get_agent_eval(agent_id: int, days: int = Query(90, description="返�
 
 @router.get("/{agent_id}/cost")
 async def get_agent_cost(agent_id: int, days: int = Query(30, description="返回天数")):
+    return cached(f"agent_cost:{agent_id}:{int(days or 30)}", READ_TTL, lambda: _agent_cost_payload(agent_id, days))
+
+
+def _agent_cost_payload(agent_id: int, days: int):
     conn = get_conn()
     data = list_agent_cost(conn, agent_id, days)
     conn.close()
@@ -449,6 +500,14 @@ async def get_agent_ideas(
     days: int = Query(30, description="返回天数"),
     status: str = Query("", description="candidate/watchlist/promoted/rejected/traded/expired"),
 ):
+    return cached(
+        f"agent_ideas:{agent_id}:{int(days or 30)}:{status or ''}",
+        READ_TTL,
+        lambda: _agent_ideas_payload(agent_id, days, status),
+    )
+
+
+def _agent_ideas_payload(agent_id: int, days: int, status: str = ""):
     conn = get_conn()
     data = list_agent_ideas(conn, agent_id, days, status)
     summary = idea_summary(conn, agent_id, days)
@@ -458,6 +517,10 @@ async def get_agent_ideas(
 
 @router.get("/{agent_id}/idea-outcomes")
 async def get_agent_idea_outcomes(agent_id: int, days: int = Query(90, description="返回天数")):
+    return cached(f"agent_ideas:{agent_id}:outcomes:{int(days or 90)}", READ_TTL, lambda: _agent_idea_outcomes_payload(agent_id, days))
+
+
+def _agent_idea_outcomes_payload(agent_id: int, days: int):
     conn = get_conn()
     data = list_agent_ideas(conn, agent_id, days)
     summary = idea_summary(conn, agent_id, days)
@@ -471,6 +534,7 @@ async def update_agent_ideas_outcome(limit: int = Query(300)):
     result = update_agent_idea_outcomes(conn, limit)
     conn.commit()
     conn.close()
+    _invalidate_agent_cache()
     return result
 
 
@@ -534,6 +598,7 @@ async def replace_agent_stock_pool_api(agent_id: int, req: StockPoolReplaceReque
     if not AgentManager.get(agent_id):
         return {"error": "Agent not found"}
     rows = AgentManager.replace_stock_pool(agent_id, [item.model_dump() for item in req.items])
+    _invalidate_agent_cache(agent_id)
     return {"items": rows}
 
 
@@ -544,12 +609,14 @@ async def upsert_agent_stock_pool_item_api(agent_id: int, req: StockPoolItemRequ
     item = AgentManager.upsert_stock_pool_item(agent_id, req.model_dump())
     if not item:
         return {"error": "invalid ts_code"}
+    _invalidate_agent_cache(agent_id)
     return {"item": item}
 
 
 @router.delete("/{agent_id}/stock-pool/{ts_code}")
 async def delete_agent_stock_pool_item_api(agent_id: int, ts_code: str):
     AgentManager.delete_stock_pool_item(agent_id, ts_code)
+    _invalidate_agent_cache(agent_id)
     return {"ok": True}
 
 
@@ -564,6 +631,7 @@ async def create_agent_api(req: CreateAgentRequest):
         risk_config=req.risk_config,
         initial_capital=req.initial_capital,
     )
+    _invalidate_agent_cache(agent_id)
     return {"id": agent_id, "name": req.name}
 
 
@@ -622,6 +690,7 @@ async def run_agent_reflection(agent_id: int, task_type: str = Query("manual")):
     conn.commit()
     conn.close()
     result = run_reflection_task(task_id)
+    _invalidate_agent_cache(agent_id)
     return {"task_id": task_id, "result": result}
 
 
@@ -629,6 +698,7 @@ async def run_agent_reflection(agent_id: int, task_type: str = Query("manual")):
 async def delete_agent_api(agent_id: int):
     """删除 Agent"""
     AgentManager.delete(agent_id)
+    _invalidate_agent_cache(agent_id)
     return {"status": "deleted", "id": agent_id}
 
 
@@ -636,6 +706,7 @@ async def delete_agent_api(agent_id: int):
 async def rename_agent_api(agent_id: int, display_name: str = Query(...)):
     """重命名 Agent"""
     AgentManager.rename(agent_id, display_name)
+    _invalidate_agent_cache(agent_id)
     return {"status": "ok"}
 
 
@@ -643,6 +714,7 @@ async def rename_agent_api(agent_id: int, display_name: str = Query(...)):
 async def configure_agent_api(agent_id: int, req: ConfigureAgentRequest):
     """配置 Agent 风控参数和策略"""
     AgentManager.configure(agent_id, req.risk_config, req.strategy_ids)
+    _invalidate_agent_cache(agent_id)
     return {"status": "ok"}
 
 
@@ -672,6 +744,7 @@ async def simulate_agent_day(agent_id: int, trade_date: str = Query(..., descrip
     trades = execute_orders(agent_id, trade_date, price_data)
     conn.commit()
     conn.close()
+    _invalidate_agent_cache(agent_id)
     return {"trades": len(trades), "date": trade_date}
 
 
@@ -687,6 +760,7 @@ async def set_or_toggle_agent_status(agent_id: int, req: Optional[StatusRequest]
         new_status = AgentManager.toggle_status(agent_id)
     if new_status is None:
         return {"error": "Agent not found"}
+    _invalidate_agent_cache(agent_id)
     return {"status": new_status, "id": agent_id}
 
 
@@ -704,6 +778,7 @@ async def configure_agent_schedule(agent_id: int, req: ScheduleRequest):
     )
     if not ok:
         return {"error": "Agent not found"}
+    _invalidate_agent_cache(agent_id)
     return {"status": "ok", "schedule": AgentManager.get_schedule(agent_id)}
 
 
@@ -711,7 +786,9 @@ async def configure_agent_schedule(agent_id: int, req: ScheduleRequest):
 async def run_due_agents_api():
     """由系统 cron 调用：运行到点且启用的 Agent。"""
     from backend.pipeline.daily_pipeline import run_due_agents
-    return run_due_agents()
+    result = run_due_agents()
+    _invalidate_agent_cache()
+    return result
 
 
 @router.get("/{agent_id}/reports")

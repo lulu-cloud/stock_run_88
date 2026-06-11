@@ -12,8 +12,10 @@ from backend.macro.report import (
     refresh_macro_intelligence,
     resolve_trade_date,
 )
+from backend.cache import cached, invalidate
 
 router = APIRouter(prefix="/api/macro", tags=["macro"])
+MACRO_TTL = 600
 
 
 def _row_payload(row: dict | None) -> dict:
@@ -37,7 +39,7 @@ def _row_payload(row: dict | None) -> dict:
 
 @router.get("/report")
 async def get_macro_report(trade_date: str = Query(default="", description="交易日 YYYYMMDD，空为最新")):
-    return _row_payload(get_macro_report_row(trade_date))
+    return cached(f"macro:report:{trade_date or 'latest'}", MACRO_TTL, lambda: _row_payload(get_macro_report_row(trade_date)))
 
 
 @router.post("/report/generate")
@@ -46,6 +48,7 @@ async def generate_report(
     force: bool = Query(default=True),
 ):
     result = generate_macro_report(trade_date, force=force)
+    invalidate("macro:")
     payload = dict(result)
     payload["report"] = _row_payload(result.get("report"))
     return payload
@@ -58,6 +61,7 @@ async def refresh_report(
     force: bool = Query(default=True),
 ):
     result = refresh_macro_intelligence(trade_date, refresh_policy=refresh_policy, force=force)
+    invalidate("macro:")
     report = (result.get("report") or {}).get("report")
     if report:
         result["report"]["report"] = _row_payload(report)
@@ -69,12 +73,16 @@ async def macro_topic(
     topic: str = Query(default="report", description="report/sector/lhb/limit_up/limit_down/broken_limit/strong"),
     trade_date: str = Query(default="", description="交易日 YYYYMMDD，空为最新"),
 ):
-    return {"topic": topic, "trade_date": resolve_trade_date(trade_date), "message": format_macro_topic(topic, trade_date)}
+    return cached(
+        f"macro:topic:{topic}:{trade_date or 'latest'}",
+        MACRO_TTL,
+        lambda: {"topic": topic, "trade_date": resolve_trade_date(trade_date), "message": format_macro_topic(topic, trade_date)},
+    )
 
 
 @router.get("/chip/{ts_code}")
 async def macro_chip(ts_code: str):
-    return {"message": format_chip_distribution(ts_code)}
+    return cached(f"macro:chip:{ts_code}", 1800, lambda: {"message": format_chip_distribution(ts_code)})
 
 
 @router.get("/fundamental/{ts_code}")
@@ -83,16 +91,24 @@ async def macro_fundamental(
     trade_date: str = Query(default="", description="交易日 YYYYMMDD，空为最新"),
     days: int = Query(default=365),
 ):
+    return cached(
+        f"macro:fundamental:{ts_code}:{trade_date or 'latest'}:{int(days or 365)}",
+        1800,
+        lambda: _fundamental_payload(ts_code, trade_date, days),
+    )
+
+
+def _fundamental_payload(ts_code: str, trade_date: str, days: int) -> dict:
     data, status = collect_stock_fundamental_events(ts_code, trade_date, days)
     return {"data": data, "status": status}
 
 
 @router.get("/status")
 async def macro_status():
+    return cached("macro:status", MACRO_TTL, _macro_status_payload)
+
+
+def _macro_status_payload() -> dict:
     trade_date = resolve_trade_date("")
     row = get_macro_report_row(trade_date)
-    return {
-        "trade_date": trade_date,
-        "report_time": get_effective_macro_report_time(),
-        "report": _row_payload(row),
-    }
+    return {"trade_date": trade_date, "report_time": get_effective_macro_report_time(), "report": _row_payload(row)}

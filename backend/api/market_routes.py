@@ -10,8 +10,10 @@ from backend.data.indicators import (
     compute_sector_temperature,
 )
 from backend.data.tags import load_tag_map
+from backend.cache import cached
 
 router = APIRouter(prefix="/api/market", tags=["market"])
+MARKET_TTL = 600
 
 # Cache stock list for search
 _stock_search_cache = None
@@ -60,6 +62,10 @@ async def search_stocks(
 @router.get("/tags")
 async def get_market_tags():
     """获取股票板块/行业 Tag 列表"""
+    return cached("market:tags", 1800, _market_tags_payload)
+
+
+def _market_tags_payload():
     stocks = _get_stock_list()
     sectors = sorted({s.get("sector_tag") for s in stocks if s.get("sector_tag")})
     industries = sorted({s.get("industry_tag") for s in stocks if s.get("industry_tag")})
@@ -69,6 +75,10 @@ async def get_market_tags():
 @router.get("/index")
 async def get_index_data(days: int = Query(default=30, le=2000)):
     """获取上证指数最近 N 天数据"""
+    return cached(f"market:index:{int(days or 30)}", MARKET_TTL, lambda: _index_data_payload(days))
+
+
+def _index_data_payload(days: int):
     df = load_index_daily()
     if df is None or df.empty:
         return {"data": [], "error": "暂无指数数据"}
@@ -98,6 +108,10 @@ async def get_index_data(days: int = Query(default=30, le=2000)):
 @router.get("/sector-heat")
 async def get_sector_heat(trade_date: str = Query(default="", description="交易日 YYYYMMDD，空为最新")):
     """获取板块热度排行"""
+    return cached(f"market:sector_heat:{trade_date or 'latest'}", MARKET_TTL, lambda: _sector_heat_payload(trade_date))
+
+
+def _sector_heat_payload(trade_date: str):
     results = compute_sector_heat(trade_date)
     return {"sectors": results, "total": len(results)}
 
@@ -134,7 +148,7 @@ async def get_sector_strength(
 @router.get("/breadth")
 async def get_market_breadth(trade_date: str = Query(default="", description="交易日 YYYYMMDD，空为最新")):
     """获取全市场涨跌宽度、涨停/大涨/跌停/大跌分布。"""
-    return compute_market_breadth(trade_date)
+    return cached(f"market:breadth:{trade_date or 'latest'}", MARKET_TTL, lambda: compute_market_breadth(trade_date))
 
 
 @router.get("/sector-temperature")
@@ -143,7 +157,11 @@ async def get_sector_temperature(
     top_n: int = Query(default=20, ge=5, le=50),
 ):
     """获取按当日涨跌分布计算的板块温度。"""
-    return compute_sector_temperature(trade_date, top_n)
+    return cached(
+        f"market:sector_temperature:{trade_date or 'latest'}:{int(top_n or 20)}",
+        MARKET_TTL,
+        lambda: compute_sector_temperature(trade_date, top_n),
+    )
 
 
 # ---- Stock K-line for frontend ----
@@ -151,6 +169,10 @@ async def get_sector_temperature(
 @router.get("/stock/kline/{ts_code}")
 async def get_stock_kline(ts_code: str, days: int = Query(default=400, le=2000)):
     """获取个股K线数据（含均线、成交量）"""
+    return cached(f"market:stock_kline:{ts_code}:{int(days or 400)}", 300, lambda: _stock_kline_payload(ts_code, days))
+
+
+def _stock_kline_payload(ts_code: str, days: int):
     df = load_daily(ts_code)
     if df is None or df.empty:
         return {"error": "未找到数据", "data": []}

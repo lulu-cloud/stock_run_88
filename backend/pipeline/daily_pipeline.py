@@ -1729,6 +1729,17 @@ def run_daily_pipeline(trade_date: str = None, agent_ids: list[int] | None = Non
         results["_idea_outcomes"] = {"error": str(idea_error)}
     conn.commit()
     conn.close()
+    try:
+        from backend.cache import invalidate
+        invalidate("agent:")
+        invalidate("agent_detail:")
+        invalidate("agent_eval:")
+        invalidate("agent_cost:")
+        invalidate("agent_ideas:")
+        invalidate("market:")
+        invalidate("macro:")
+    except Exception:
+        pass
     return results
 
 
