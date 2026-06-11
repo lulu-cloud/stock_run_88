@@ -54,7 +54,7 @@ jobs:
             cd ..
             sudo timeout 20 systemctl stop stock-run-api || true
             sudo systemctl kill stock-run-api || true
-            sudo pkill -9 -f "uvicorn backend.main:app" || true
+            sudo pkill -9 -f "[u]vicorn backend.main:app" || true
             sudo systemctl reset-failed stock-run-api || true
             sudo systemctl start stock-run-api
             sleep 5
