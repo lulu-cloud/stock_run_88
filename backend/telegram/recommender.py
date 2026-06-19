@@ -61,6 +61,7 @@ from backend.telegram.knowledge import (
 )
 from backend.telegram.evaluation import record_recommend_eval
 from backend.data.loader import load_daily
+from backend.telegram.message_gate import is_lightweight_action, preflight_route
 from backend.telegram.partnership_account import (
     dispatch_partnership_command,
     is_partnership_account_message,
@@ -1817,6 +1818,9 @@ def handle_text_message(
 ) -> str:
     """Record scoped memory around the existing Telegram text parser."""
     raw = (text or "").strip()
+    gate = preflight_route(raw)
+    if is_lightweight_action(gate.action):
+        return gate.reply
     intent = _guess_intent(raw)
     if progress_callback:
         progress_callback({"type": "intent", "intent": intent})

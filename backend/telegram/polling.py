@@ -21,6 +21,7 @@ from backend.telegram.gateway import (
     send_rich_message,
     send_message,
 )
+from backend.telegram.message_gate import is_lightweight_action, preflight_route
 from backend.telegram.recommender import handle_text_message
 from backend.auth import generate_login_code, format_login_code_message, is_allowed_telegram_user
 
@@ -250,6 +251,15 @@ def _handle_update(update: dict):
     if lower.startswith("/login"):
         result = generate_login_code(user_id, chat_id, username)
         send_message(chat_id, format_login_code_message(result, user_id))
+        _state["last_message"] = text[:200]
+        return
+    gate = preflight_route(text)
+    if is_lightweight_action(gate.action):
+        result = send_rich_message(chat_id, gate.reply, "推荐助手")
+        if not result.get("ok"):
+            _state["last_send_error"] = result.get("error", "")
+        else:
+            _state["last_send_error"] = ""
         _state["last_message"] = text[:200]
         return
     progress = _TelegramProgress(chat_id)
