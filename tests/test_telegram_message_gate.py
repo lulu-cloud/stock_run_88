@@ -22,6 +22,16 @@ class TelegramMessageGateTestCase(unittest.TestCase):
         for text in ("京东方A怎么看", "推荐几只多头均线回踩的股票", "今天龙虎榜和北向资金如何", "我重仓603629要止损吗"):
             self.assertEqual(preflight_route(text).action, "agent_task", text)
 
+    def test_multi_stock_ranking_questions_go_to_agent_task(self):
+        with patch("backend.telegram.message_gate._stock_mentions", return_value=["002463.SZ", "600487.SH", "603986.SH", "002384.SZ"]):
+            result = preflight_route("沪电股份 亨通光电 兆易创新 东山精密，留三个，保留哪三个？")
+        self.assertEqual(result.action, "agent_task")
+
+    def test_single_stock_keep_question_goes_to_agent_task(self):
+        with patch("backend.telegram.message_gate._stock_mentions", return_value=["002463.SZ"]):
+            result = preflight_route("沪电股份还能留吗")
+        self.assertEqual(result.action, "agent_task")
+
     def test_known_commands_go_to_command_route(self):
         for text in ("/login", "/whoami", "/watch list", "/profile", "/memory", "/recommend 强势股", "/compare 600000.SH 600036.SH", "/intraday"):
             self.assertEqual(preflight_route(text).action, "command_route", text)

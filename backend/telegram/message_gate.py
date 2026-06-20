@@ -37,6 +37,13 @@ ANALYSIS_WORDS = (
     "趋势", "风险", "目标价", "支撑", "压力",
 )
 
+RANKING_WORDS = (
+    "留几个", "留几只", "留三个", "留两只", "留哪", "留吗", "能留", "还能留",
+    "保留", "留下", "去掉", "删掉", "剔除", "淘汰", "取舍", "排序", "排名",
+    "排个序", "排一下", "优先级", "二选一", "三选二", "四选三", "哪个更好",
+    "哪只更好", "更值得", "更强",
+)
+
 GREETING_TEXTS = {
     "你好", "您好", "hi", "hello", "hey", "在吗", "在不在", "你是谁", "你能做什么",
     "你会什么", "怎么用", "help", "帮助", "/start", "/help",
@@ -96,10 +103,24 @@ def _has_stock_code(raw: str) -> bool:
     )
 
 
+def _stock_mentions(raw: str) -> list[str]:
+    try:
+        from backend.telegram.stock_analysis import extract_stock_mentions
+
+        return extract_stock_mentions(raw, max_results=8)
+    except Exception:
+        return []
+
+
 def _looks_like_stock_question(raw: str) -> bool:
     if _has_stock_code(raw):
         return True
     if any(keyword in raw for keyword in STOCK_TASK_KEYWORDS):
+        return True
+    mentions = _stock_mentions(raw)
+    if len(mentions) >= 2:
+        return True
+    if mentions and any(word in raw for word in ANALYSIS_WORDS + RANKING_WORDS):
         return True
     if any(word in raw for word in ANALYSIS_WORDS) and len(raw) <= 80:
         return True
