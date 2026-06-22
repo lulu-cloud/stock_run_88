@@ -15,7 +15,7 @@ from backend.agents.base import AgentContext, AgentDecision
 from backend.agents.react_loop import ReActLoop
 from backend.data.loader import load_daily
 from backend.llm.json_repair import extract_json_object
-from backend.llm.prompt_safety import untrusted_text_block
+from backend.llm.prompt_safety import trusted_strategy_block
 from backend.trading.rules import normalize_ts_code
 from backend.macro.report import get_macro_daily_report_text
 
@@ -427,7 +427,7 @@ def run_agent_review(
     board_permissions = config.get("board_permissions") or {}
     style_prompt = (config.get("style_prompt") or "").strip()
     user_strategy = (config.get("user_strategy_original") or "").strip()
-    user_strategy_block = untrusted_text_block("user_strategy", user_strategy)
+    user_strategy_block = trusted_strategy_block("user_strategy", user_strategy)
     stock_pool = config.get("stock_pool") or []
     stock_pool_enabled = bool(config.get("stock_pool_enabled"))
     allow_out_of_pool = bool(config.get("allow_out_of_pool"))

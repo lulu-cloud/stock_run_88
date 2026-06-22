@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import patch
 
 from backend.evolution import memory
+from backend.evolution.engine import format_evolution_prompt
 
 
 class AgentStyleMemoryTestCase(unittest.TestCase):
@@ -54,6 +55,19 @@ class AgentStyleMemoryTestCase(unittest.TestCase):
         self.assertIn("全因子自主交易员", snapshot["trade_prefer"])
         self.assertNotIn("短线情绪/打板交易员", snapshot["trade_prefer"])
 
+    def test_evolution_prompt_keeps_user_strategy_as_trusted_baseline(self):
+        prompt = format_evolution_prompt({
+            "memory_snapshot": {},
+            "skills": [],
+            "agent_config": {
+                "agent_type": "user_style",
+                "user_strategy_original": "Only trade confirmed breakouts.",
+            },
+        })
+
+        self.assertIn("<trusted_user_strategy>", prompt)
+        self.assertIn("Only trade confirmed breakouts.", prompt)
+        self.assertNotIn("<untrusted_user_strategy>", prompt)
 
 if __name__ == "__main__":
     unittest.main()

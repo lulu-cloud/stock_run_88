@@ -8,12 +8,12 @@ from datetime import datetime
 
 from backend.config import LOGS_DIR
 from backend.evolution.memory import seed_agent_style_memory, snapshot_memory, update_memory
-from backend.evolution.minute_replay import build_intraday_replay
-from backend.evolution.skills import ensure_default_skills, list_skill_index, update_skill_confidence
-from backend.llm.prompt_safety import untrusted_text_block
+from backend.llm.prompt_safety import trusted_strategy_block
 
 
 def prepare_evolution_context(agent_id: int, agent_name: str, trade_date: str, conn) -> dict:
+    from backend.evolution.skills import ensure_default_skills, list_skill_index
+
     ensure_default_skills(agent_id, agent_name, conn)
     agent_config = _load_agent_config(agent_id, conn)
     seed_agent_style_memory(agent_id, agent_name, agent_config)
@@ -43,6 +43,7 @@ def prepare_evolution_context(agent_id: int, agent_name: str, trade_date: str, c
         "agent_id": agent_id,
         "agent_name": agent_name,
         "trade_date": trade_date,
+        "agent_config": agent_config,
         "memory_snapshot": memory_snapshot,
         "skills": skills,
         "system_doc": system_doc,
@@ -122,7 +123,7 @@ def format_evolution_prompt(context: dict | None) -> str:
         "\n".join(skill_lines) if skill_lines else "暂无技能，按默认谨慎模式。",
         "## Agent配置约束",
         f"- Agent风格提示词: {style_prompt or '未配置'}",
-        f"- 用户原始交易策略: {untrusted_text_block('user_strategy', user_strategy)}",
+        f"- 用户原始交易策略: {trusted_strategy_block('user_strategy', user_strategy)}",
         f"- 优先选股策略: {', '.join(preferred_strategies) if preferred_strategies else '未配置，按风格自主选择'}",
         f"- 严格工具白名单: {', '.join(allowed_tools) if allowed_tools else '未配置，允许默认工具集'}",
         f"- 买入板块权限: {json.dumps(board_permissions, ensure_ascii=False)}",
@@ -142,6 +143,9 @@ def format_evolution_prompt(context: dict | None) -> str:
 def run_post_daily_evolution(agent_id: int, agent_name: str, trade_date: str,
                              trades: list[dict], decision, daily_metrics: dict,
                              conn) -> dict:
+    from backend.evolution.minute_replay import build_intraday_replay
+    from backend.evolution.skills import update_skill_confidence
+
     expired_rows = conn.execute(
         """SELECT id, ts_code, stock_name, direction, quantity, price, status, fail_reason, skill_id
            FROM agent_order
