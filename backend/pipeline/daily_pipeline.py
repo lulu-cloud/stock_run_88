@@ -592,7 +592,56 @@ def check_data_freshness(trade_date: str) -> bool:
             f"[DataFreshness] {trade_date} partial coverage accepted: "
             f"{ready}/{total}={ratio:.1%}; missing sample: {', '.join(missing_sample)}"
         )
+    critical_missing = _missing_critical_agent_symbols(trade_date)
+    if critical_missing:
+        print(
+            f"[DataFreshness] {trade_date} critical agent symbols missing: "
+            f"{', '.join(critical_missing[:20])}"
+        )
+        return False
     return True
+
+
+def _critical_agent_symbols(trade_date: str) -> set[str]:
+    """Symbols that must have current-day data before any Agent review runs."""
+    symbols: set[str] = set()
+    try:
+        conn = get_conn()
+        try:
+            rows = conn.execute(
+                """SELECT DISTINCT ts_code FROM agent_position
+                   WHERE quantity>0 AND ts_code IS NOT NULL AND ts_code<>''"""
+            ).fetchall()
+            symbols.update(str(r["ts_code"]) for r in rows if r["ts_code"])
+            rows = conn.execute(
+                """SELECT DISTINCT ts_code FROM agent_order
+                   WHERE ts_code IS NOT NULL AND ts_code<>''
+                     AND (status='pending' OR trade_date>=?)""",
+                (trade_date,),
+            ).fetchall()
+            symbols.update(str(r["ts_code"]) for r in rows if r["ts_code"])
+            rows = conn.execute(
+                """SELECT DISTINCT ts_code FROM agent_trade_log
+                   WHERE ts_code IS NOT NULL AND ts_code<>'' AND trade_date>=?""",
+                (trade_date,),
+            ).fetchall()
+            symbols.update(str(r["ts_code"]) for r in rows if r["ts_code"])
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[DataFreshness] critical symbol query failed: {e}")
+    return symbols
+
+
+def _missing_critical_agent_symbols(trade_date: str) -> list[str]:
+    from backend.config import DAILY_DIR
+
+    missing: list[str] = []
+    for ts_code in sorted(_critical_agent_symbols(trade_date)):
+        latest = _latest_csv_trade_date(os.path.join(DAILY_DIR, f"{ts_code}_daily.csv"))
+        if not latest or latest < trade_date:
+            missing.append(f"{ts_code}:{latest or '-'}")
+    return missing
 
 
 def _parse_retry_at(value: str | None, now: datetime) -> datetime | None:

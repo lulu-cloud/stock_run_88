@@ -66,7 +66,9 @@ def account_help() -> str:
         "/init xulu hsw 150000 100000",
         "/init 初始建仓，xulu出资15万，hsw出资10万",
         "/daily 256000 0 5000",
+        "/daily amend 465759.29  更正最近一天录错的总资产",
         "今天总资产25.6万，hsw入金5000",
+        "刚刚录错了，今天总资产改成46.575929万",
         "/status 查看当前权益和累计盈亏",
         "/history 查看最近7天分成明细",
         "",
@@ -130,12 +132,26 @@ def _parse_total_asset(raw: str) -> float | None:
     m = re.search(r"(?:总资产|总权益|账户资产|合并账户|账户)\s*(?:是|为|=|:|：)?\s*([+-]?\d+(?:\.\d+)?\s*(?:万|w|W|千|k|K)?)", raw)
     if m:
         return _money(m.group(1))
-    parts = [x for x in re.split(r"\s+", re.sub(r"^/daily(@\w+)?", "", raw, flags=re.I).strip()) if x]
-    if parts and re.fullmatch(r"20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}", parts[0]):
-        parts = parts[1:]
+    parts = _daily_value_parts(raw)
     if parts:
         return _money(parts[0])
     return None
+
+
+def _is_correction(raw: str) -> bool:
+    lower = (raw or "").lower()
+    return any(token in lower for token in ("amend", "update", "correct", "fix", "append", "overwrite")) or any(
+        token in (raw or "") for token in ("更正", "修正", "改成", "改为", "录错", "覆盖", "重算", "重新记", "重新上报")
+    )
+
+
+def _daily_value_parts(raw: str) -> list[str]:
+    body = re.sub(r"^/daily(@\w+)?", "", raw or "", flags=re.I).strip()
+    parts = [x for x in re.split(r"\s+", body) if x]
+    if parts and re.fullmatch(r"20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}", parts[0]):
+        parts = parts[1:]
+    control = {"amend", "update", "correct", "fix", "append", "overwrite"}
+    return [p for p in parts if p.lower() not in control]
 
 
 def _parse_daily(text: str, names: list[str]) -> tuple[str, float | None, dict[str, float], str]:
@@ -145,10 +161,7 @@ def _parse_daily(text: str, names: list[str]) -> tuple[str, float | None, dict[s
     flows = {name: 0.0 for name in names}
     aliases = _aliases(names)
 
-    body = re.sub(r"^/daily(@\w+)?", "", raw, flags=re.I).strip()
-    parts = [x for x in re.split(r"\s+", body) if x]
-    if parts and re.fullmatch(r"20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}", parts[0]):
-        parts = parts[1:]
+    parts = _daily_value_parts(raw)
     if len(parts) >= 1 and total_asset is not None and len(parts[1:]) >= len(names):
         fixed_flows = []
         ok = True
@@ -183,6 +196,142 @@ def _parse_daily(text: str, names: list[str]) -> tuple[str, float | None, dict[s
     return trade_date, total_asset, flows, ""
 
 
+def _load_json_dict(text: str | None) -> dict[str, float]:
+    try:
+        data = json.loads(text or "{}")
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    result = {}
+    for k, v in data.items():
+        try:
+            result[str(k)] = float(v or 0)
+        except Exception:
+            result[str(k)] = 0.0
+    return result
+
+
+def _apply_daily_update(
+    conn,
+    trade_date: str,
+    total_asset: float,
+    flows: dict[str, float],
+    prev_total: float,
+    prev_date: str,
+    previous_rows: list[dict],
+    existing_history: dict | None = None,
+) -> str:
+    total_flow = sum(float(v or 0) for v in flows.values())
+    daily_pnl = float(total_asset) - prev_total - total_flow
+    prev_equity_sum = sum(float(r["equity"] or 0) for r in previous_rows)
+    if prev_equity_sum <= 0:
+        return "上报失败: 昨日权益合计为 0，无法按比例分配盈亏。"
+
+    allocation: dict[str, float] = {}
+    remaining = daily_pnl
+    for idx, row in enumerate(previous_rows):
+        name = row["name"]
+        if idx == len(previous_rows) - 1:
+            share = remaining
+        else:
+            share = daily_pnl * float(row["equity"] or 0) / prev_equity_sum
+            remaining -= share
+        allocation[name] = share
+
+    before = {r["name"]: float(r["equity"] or 0) for r in previous_rows}
+    for row in previous_rows:
+        name = row["name"]
+        new_equity = before[name] + allocation[name] + flows.get(name, 0.0)
+        new_net_invest = float(row["net_invest"] or 0) + flows.get(name, 0.0)
+        conn.execute(
+            "UPDATE participants SET equity=?, net_invest=? WHERE name=?",
+            (new_equity, new_net_invest, name),
+        )
+    if existing_history:
+        conn.execute(
+            "UPDATE daily_history SET total_asset=?, daily_pnl=?, cash_flows=?, allocation=? WHERE date=?",
+            (
+                total_asset,
+                daily_pnl,
+                json.dumps(flows, ensure_ascii=False),
+                json.dumps(allocation, ensure_ascii=False),
+                trade_date,
+            ),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO daily_history (date, total_asset, daily_pnl, cash_flows, allocation) VALUES (?, ?, ?, ?, ?)",
+            (
+                trade_date,
+                total_asset,
+                daily_pnl,
+                json.dumps(flows, ensure_ascii=False),
+                json.dumps(allocation, ensure_ascii=False),
+            ),
+        )
+    conn.execute("UPDATE account SET last_total_asset=?, last_date=?", (total_asset, trade_date))
+    conn.commit()
+
+    updated = _participants(conn)
+    title = f"{trade_date} 合伙账户分成报告"
+    if existing_history:
+        title = f"{trade_date} 合伙账户更正报告"
+    lines = [
+        title,
+        f"昨日日期: {prev_date or '-'}",
+        f"昨日总资产: {_fmt_money(prev_total)}",
+        f"今日总资产: {_fmt_money(total_asset)}",
+        f"当日净入金: {_fmt_money(total_flow)}",
+        f"当日盈亏: {_fmt_money(daily_pnl)}",
+    ]
+    if existing_history:
+        lines.extend([
+            f"更正前总资产: {_fmt_money(existing_history.get('total_asset'))}",
+            f"更正前当日盈亏: {_fmt_money(existing_history.get('daily_pnl'))}",
+        ])
+    lines.extend([
+        "",
+        "盈亏按昨日权益比例分配，今日出入金 T+1 生效:",
+    ])
+    updated_by_name = {r["name"]: r for r in updated}
+    for row in previous_rows:
+        name = row["name"]
+        ratio = float(row["equity"] or 0) / prev_equity_sum * 100
+        now = updated_by_name[name]
+        pnl_total = float(now["equity"] or 0) - float(now["net_invest"] or 0)
+        lines.append(
+            f"- {name}: 昨日权益 {_fmt_money(before[name])} ({ratio:.2f}%)，"
+            f"分得盈亏 {_fmt_money(allocation[name])}，出入金 {_fmt_money(flows.get(name, 0))}，"
+            f"当前权益 {_fmt_money(now['equity'])}，累计盈亏 {_fmt_money(pnl_total)}"
+        )
+    return "\n".join(lines)
+
+
+def _amend_latest_daily(conn, account, rows: list[dict], trade_date: str, total_asset: float, flows: dict[str, float], existing_row) -> str:
+    last_date = account["last_date"] or ""
+    if last_date != trade_date:
+        return f"{trade_date} 不是当前账本最近日期（最近日期 {last_date or '-'}）。当前只支持更正最近一天，避免破坏后续分成链条。"
+
+    existing = dict(existing_row)
+    old_flows = _load_json_dict(existing.get("cash_flows"))
+    old_allocation = _load_json_dict(existing.get("allocation"))
+    old_total = float(existing.get("total_asset") or 0)
+    old_pnl = float(existing.get("daily_pnl") or 0)
+    old_total_flow = sum(float(v or 0) for v in old_flows.values())
+    prev_total = old_total - old_pnl - old_total_flow
+
+    previous_rows = []
+    for row in rows:
+        name = row["name"]
+        previous_rows.append({
+            "name": name,
+            "equity": float(row["equity"] or 0) - old_allocation.get(name, 0.0) - old_flows.get(name, 0.0),
+            "net_invest": float(row["net_invest"] or 0) - old_flows.get(name, 0.0),
+        })
+    return _apply_daily_update(conn, trade_date, total_asset, flows, prev_total, "上一记录", previous_rows, existing)
+
+
 def partnership_daily_report(text: str) -> str:
     """Record daily total asset and cash flows, then allocate PnL by prior equity ratio."""
     conn = get_conn()
@@ -197,76 +346,17 @@ def partnership_daily_report(text: str) -> str:
             return error
         if total_asset is None or total_asset < 0:
             return "上报失败: 今日总资产必须是非负数。"
-        if conn.execute("SELECT 1 FROM daily_history WHERE date=?", (trade_date,)).fetchone():
-            return f"{trade_date} 已经上报过。为避免覆盖分成历史，本次未写入。"
+        existing = conn.execute("SELECT * FROM daily_history WHERE date=?", (trade_date,)).fetchone()
+        if existing:
+            if not _is_correction(text):
+                return f"{trade_date} 已经上报过。如需更正最近一天，请发送 /daily amend {total_asset:.2f}，或说“今天总资产改成{total_asset:.2f}”。"
+            return _amend_latest_daily(conn, account, rows, trade_date, total_asset, flows, existing)
 
         prev_total = float(account["last_total_asset"] or 0)
         prev_date = account["last_date"] or ""
-        total_flow = sum(float(v or 0) for v in flows.values())
-        daily_pnl = float(total_asset) - prev_total - total_flow
-        prev_equity_sum = sum(float(r["equity"] or 0) for r in rows)
-        if prev_equity_sum <= 0:
-            return "上报失败: 昨日权益合计为 0，无法按比例分配盈亏。"
-
-        allocation: dict[str, float] = {}
-        remaining = daily_pnl
-        for idx, row in enumerate(rows):
-            name = row["name"]
-            if idx == len(rows) - 1:
-                share = remaining
-            else:
-                share = daily_pnl * float(row["equity"] or 0) / prev_equity_sum
-                remaining -= share
-            allocation[name] = share
-
-        before = {r["name"]: float(r["equity"] or 0) for r in rows}
-        for row in rows:
-            name = row["name"]
-            new_equity = before[name] + allocation[name] + flows.get(name, 0.0)
-            new_net_invest = float(row["net_invest"] or 0) + flows.get(name, 0.0)
-            conn.execute(
-                "UPDATE participants SET equity=?, net_invest=? WHERE name=?",
-                (new_equity, new_net_invest, name),
-            )
-        conn.execute(
-            "INSERT INTO daily_history (date, total_asset, daily_pnl, cash_flows, allocation) VALUES (?, ?, ?, ?, ?)",
-            (
-                trade_date,
-                total_asset,
-                daily_pnl,
-                json.dumps(flows, ensure_ascii=False),
-                json.dumps(allocation, ensure_ascii=False),
-            ),
-        )
-        conn.execute("UPDATE account SET last_total_asset=?, last_date=?", (total_asset, trade_date))
-        conn.commit()
-
-        updated = _participants(conn)
+        return _apply_daily_update(conn, trade_date, total_asset, flows, prev_total, prev_date, rows)
     finally:
         conn.close()
-
-    lines = [
-        f"{trade_date} 合伙账户分成报告",
-        f"昨日日期: {prev_date or '-'}",
-        f"昨日总资产: {_fmt_money(prev_total)}",
-        f"今日总资产: {_fmt_money(total_asset)}",
-        f"当日净入金: {_fmt_money(total_flow)}",
-        f"当日盈亏: {_fmt_money(daily_pnl)}",
-        "",
-        "盈亏按昨日权益比例分配，今日出入金 T+1 生效:",
-    ]
-    updated_by_name = {r["name"]: r for r in updated}
-    for row in rows:
-        name = row["name"]
-        ratio = float(row["equity"] or 0) / prev_equity_sum * 100
-        now = updated_by_name[name]
-        pnl_total = float(now["equity"] or 0) - float(now["net_invest"] or 0)
-        lines.append(
-            f"- {name}: 昨日权益 {_fmt_money(before[name])} ({ratio:.2f}%)，"
-            f"分得盈亏 {_fmt_money(allocation[name])}，出入金 {_fmt_money(flows.get(name, 0))}，"
-            f"当前权益 {_fmt_money(now['equity'])}，累计盈亏 {_fmt_money(pnl_total)}"
-        )
-    return "\n".join(lines)
 
 
 def partnership_status() -> str:

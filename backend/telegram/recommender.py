@@ -1907,6 +1907,7 @@ def _handle_text_message_inner(
             "/memory 查看记忆 / /memory forget 关键词\n"
             "/init xulu hsw 150000 100000 初始化合伙账户\n"
             "/daily 256000 0 5000 上报合伙账户今日总资产和出入金\n"
+            "/daily amend 465759.29 更正最近一天录错的合伙账户总资产\n"
             "/history 查看最近7天合伙账户分成记录\n"
             "/login 获取看板登录验证码 / /whoami 查看 Telegram 身份\n"
             "/status 查看合伙账户状态，/status 1 查看交易员战绩\n"
