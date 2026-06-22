@@ -1,6 +1,7 @@
 """Agent 管理 API"""
 
 import json
+from datetime import datetime
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
 from typing import Optional
@@ -78,6 +79,13 @@ class ScheduleRequest(BaseModel):
     enabled: bool = False
     review_time: str = "23:00"
     push_time: str = "23:00"
+
+
+class CapitalFlowRequest(BaseModel):
+    flow_type: str = "deposit"
+    amount: float
+    note: str = ""
+    flow_date: str = ""
 
 
 @router.get("/list")
@@ -272,6 +280,12 @@ def _agent_detail_payload(agent_id: int):
         "SELECT * FROM agent_capital_policy WHERE agent_id=? ORDER BY trade_date DESC LIMIT 1",
         (agent_id,),
     ).fetchone()
+    capital_flows = [
+        dict(r) for r in conn.execute(
+            "SELECT * FROM agent_capital_flow WHERE agent_id=? ORDER BY flow_date DESC, id DESC LIMIT 20",
+            (agent_id,),
+        ).fetchall()
+    ]
     eval_summary = latest_agent_eval(conn, agent_id)
     discovery_summary = idea_summary(conn, agent_id, 90)
     skills = [dict(r) for r in conn.execute(
@@ -360,6 +374,7 @@ def _agent_detail_payload(agent_id: int):
             "skills": skills,
             "stock_pool": stock_pool,
             "strategy_versions": AgentManager.list_user_strategy_versions(agent_id, 20),
+            "capital_flows": capital_flows,
         },
         "positions": [
             {
@@ -716,6 +731,81 @@ async def configure_agent_api(agent_id: int, req: ConfigureAgentRequest):
     AgentManager.configure(agent_id, req.risk_config, req.strategy_ids)
     _invalidate_agent_cache(agent_id)
     return {"status": "ok"}
+
+
+@router.get("/{agent_id}/capital-flow")
+async def list_agent_capital_flow_api(agent_id: int, limit: int = Query(50)):
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM agent_capital_flow WHERE agent_id=? ORDER BY flow_date DESC, id DESC LIMIT ?",
+        (agent_id, max(1, min(int(limit or 50), 200))),
+    ).fetchall()
+    conn.close()
+    return {"items": [dict(r) for r in rows]}
+
+
+@router.post("/{agent_id}/capital-flow")
+async def create_agent_capital_flow_api(agent_id: int, req: CapitalFlowRequest):
+    flow_type = str(req.flow_type or "").lower()
+    if flow_type not in {"deposit", "withdraw"}:
+        return {"error": "flow_type must be deposit or withdraw"}
+    amount = float(req.amount or 0)
+    if amount <= 0:
+        return {"error": "amount must be positive"}
+    signed = amount if flow_type == "deposit" else -amount
+    flow_date = str(req.flow_date or "").strip() or datetime.now().strftime("%Y-%m-%d")
+
+    conn = get_conn()
+    try:
+        agent = conn.execute(
+            "SELECT id, current_cash, initial_capital FROM agent_info WHERE id=?",
+            (agent_id,),
+        ).fetchone()
+        if not agent:
+            return {"error": "Agent not found"}
+        cash_before = float(agent["current_cash"] or 0)
+        initial_before = float(agent["initial_capital"] or 0)
+        cash_after = cash_before + signed
+        initial_after = initial_before + signed
+        if cash_after < 0:
+            return {"error": f"cash would become negative: {cash_after:.2f}"}
+        if initial_after <= 0:
+            return {"error": f"initial_capital would become non-positive: {initial_after:.2f}"}
+        conn.execute(
+            "UPDATE agent_info SET current_cash=?, initial_capital=?, updated_at=datetime('now') WHERE id=?",
+            (cash_after, initial_after, agent_id),
+        )
+        cur = conn.execute(
+            """INSERT INTO agent_capital_flow
+               (agent_id, flow_date, flow_type, amount, cash_before, cash_after,
+                initial_before, initial_after, note, created_by)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'dashboard')""",
+            (
+                agent_id,
+                flow_date,
+                flow_type,
+                amount,
+                cash_before,
+                cash_after,
+                initial_before,
+                initial_after,
+                req.note or "",
+            ),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM agent_capital_flow WHERE id=?", (cur.lastrowid,)).fetchone()
+    finally:
+        conn.close()
+    _invalidate_agent_cache(agent_id)
+    return {
+        "status": "ok",
+        "flow": dict(row) if row else {},
+        "agent": {
+            "id": agent_id,
+            "current_cash": round(cash_after, 2),
+            "initial_capital": round(initial_after, 2),
+        },
+    }
 
 
 @router.post("/{agent_id}/simulate")

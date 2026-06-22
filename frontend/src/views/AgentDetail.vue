@@ -64,6 +64,37 @@
         </select>
         <button class="btn btn-sm btn-primary" @click="saveConfig">保存配置</button>
       </div>
+      <div class="capital-panel">
+        <div>
+          <div class="cfg-title">资金调整</div>
+          <p class="small-muted">入金/出金会同时调整可用资金和本金，并写入流水；不会改历史成交。</p>
+        </div>
+        <div class="capital-form">
+          <select v-model="capitalFlowForm.flow_type">
+            <option value="deposit">入金</option>
+            <option value="withdraw">出金</option>
+          </select>
+          <input v-model.number="capitalFlowForm.amount" type="number" min="0" step="1000" placeholder="金额" />
+          <input v-model="capitalFlowForm.note" placeholder="备注，如 追加本金" />
+          <button class="btn btn-sm btn-primary" @click="submitCapitalFlow" :disabled="capitalFlowSubmitting">
+            {{ capitalFlowSubmitting ? '提交中...' : '提交资金流水' }}
+          </button>
+        </div>
+        <table class="capital-flow-table">
+          <thead><tr><th>日期</th><th>类型</th><th>金额</th><th>现金变化</th><th>本金变化</th><th>备注</th></tr></thead>
+          <tbody>
+            <tr v-for="flow in capitalFlows" :key="flow.id">
+              <td class="mono">{{ flow.flow_date }}</td>
+              <td>{{ flow.flow_type === 'deposit' ? '入金' : '出金' }}</td>
+              <td class="mono" :class="flow.flow_type === 'deposit' ? 'green' : 'red'">{{ flow.flow_type === 'deposit' ? '+' : '-' }}{{ money(flow.amount) }}</td>
+              <td class="mono">{{ money(flow.cash_before) }} → {{ money(flow.cash_after) }}</td>
+              <td class="mono">{{ money(flow.initial_before) }} → {{ money(flow.initial_after) }}</td>
+              <td>{{ flow.note || '-' }}</td>
+            </tr>
+            <tr v-if="!capitalFlows.length"><td colspan="6" class="empty-row">暂无资金流水</td></tr>
+          </tbody>
+        </table>
+      </div>
       <div class="agent-config-board">
         <div class="config-panel">
           <div class="cfg-title">Agent风格提示词</div>
@@ -550,6 +581,9 @@ const stockSearchText = ref('')
 const stockSearchResults = ref([])
 const toolCatalog = ref([])
 const strategyOptions = ref([])
+const capitalFlows = ref([])
+const capitalFlowSubmitting = ref(false)
+const capitalFlowForm = ref({ flow_type: 'deposit', amount: null, note: '' })
 let detailRequestSeq = 0
 const stagePromptFields = [
   { key: 'market_scan', label: '行情感知' },
@@ -816,6 +850,7 @@ async function loadDetail() {
     positions.value = d.positions
     trades.value = d.trades
     pendingOrders.value = d.pending_orders
+    capitalFlows.value = d.agent.capital_flows || []
     statusForm.value.status = d.agent.status || 'active'
     scheduleForm.value = { enabled: false, review_time: '21:00', push_time: '16:00', ...(d.agent.schedule || {}) }
     const cfg = d.agent.risk_config || {}
@@ -849,6 +884,7 @@ async function loadDetail() {
     positions.value = []
     trades.value = []
     pendingOrders.value = []
+    capitalFlows.value = []
     loadError.value = err.response?.data?.detail || err.message || '加载失败'
   } finally {
     if (seq === detailRequestSeq) loading.value = false
@@ -983,6 +1019,31 @@ async function saveConfig() {
   await loadDetail()
 }
 
+async function submitCapitalFlow() {
+  if (!agent.value || capitalFlowSubmitting.value) return
+  const amount = Number(capitalFlowForm.value.amount || 0)
+  if (!Number.isFinite(amount) || amount <= 0) {
+    alert('请输入大于 0 的金额')
+    return
+  }
+  capitalFlowSubmitting.value = true
+  try {
+    const res = await agentAPI.addCapitalFlow(route.params.id, {
+      flow_type: capitalFlowForm.value.flow_type || 'deposit',
+      amount,
+      note: capitalFlowForm.value.note || '',
+    })
+    if (res.data?.error) {
+      alert(res.data.error)
+      return
+    }
+    capitalFlowForm.value = { flow_type: 'deposit', amount: null, note: '' }
+    await loadDetail()
+  } finally {
+    capitalFlowSubmitting.value = false
+  }
+}
+
 onMounted(async () => { await loadCatalog(); await loadDetail() })
 watch(() => route.params.id, loadDetail)
 watch(activeTab, () => {
@@ -1010,6 +1071,15 @@ watch(activeTab, () => {
 .config-row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; font-size:12px; }
 .config-row label { color:var(--text-dim); }
 .config-row input:not([type="checkbox"]), .config-row select { width:92px; font-size:12px; }
+.capital-panel {
+  margin-top:12px; border:1px solid var(--border); border-radius:8px;
+  padding:12px; background:var(--bg-deep);
+}
+.capital-form { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:10px 0; }
+.capital-form select { width:90px; }
+.capital-form input[type="number"] { width:140px; }
+.capital-form input:not([type="number"]) { min-width:220px; flex:1; }
+.capital-flow-table { margin-top:8px; }
 .agent-config-board { display:grid; grid-template-columns:1fr 1.4fr; gap:12px; margin-top:12px; }
 .config-panel { border:1px solid var(--border); border-radius:8px; padding:12px; background:var(--bg-deep); min-width:0; }
 .cfg-title { font-size:12px; font-weight:700; color:var(--text-primary); margin-bottom:8px; }

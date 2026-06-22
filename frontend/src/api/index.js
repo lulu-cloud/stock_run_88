@@ -28,6 +28,8 @@ export const agentAPI = {
   delete: (id) => api.delete(`/agent/${id}`),
   rename: (id, displayName) => api.put(`/agent/${id}/rename?display_name=${encodeURIComponent(displayName)}`),
   configure: (id, data) => api.put(`/agent/${id}/configure`, data),
+  capitalFlows: (id, limit = 50) => api.get(`/agent/${id}/capital-flow?limit=${limit}`),
+  addCapitalFlow: (id, data) => api.post(`/agent/${id}/capital-flow`, data),
   toggleStatus: (id) => api.put(`/agent/${id}/status`),
   setStatus: (id, status) => api.put(`/agent/${id}/status`, { status }),
   schedule: (id) => api.get(`/agent/${id}/schedule`),

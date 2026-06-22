@@ -389,6 +389,21 @@ CREATE TABLE IF NOT EXISTS agent_capital_policy (
     UNIQUE(agent_id, trade_date)
 );
 
+CREATE TABLE IF NOT EXISTS agent_capital_flow (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id        INTEGER NOT NULL REFERENCES agent_info(id),
+    flow_date       TEXT NOT NULL,
+    flow_type       TEXT NOT NULL CHECK(flow_type IN ('deposit','withdraw')),
+    amount          REAL NOT NULL,
+    cash_before     REAL NOT NULL,
+    cash_after      REAL NOT NULL,
+    initial_before  REAL NOT NULL,
+    initial_after   REAL NOT NULL,
+    note            TEXT,
+    created_by      TEXT DEFAULT 'dashboard',
+    created_at      TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS agent_reflection_task (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     agent_id        INTEGER NOT NULL REFERENCES agent_info(id),
@@ -572,6 +587,7 @@ CREATE INDEX IF NOT EXISTS idx_evo_skill_agent ON agent_evolution_skill(agent_id
 CREATE INDEX IF NOT EXISTS idx_evo_event_agent ON agent_evolution_event(agent_id, trade_date);
 CREATE INDEX IF NOT EXISTS idx_race_metric_agent ON agent_race_metric(agent_id, trade_date);
 CREATE INDEX IF NOT EXISTS idx_agent_eval_agent ON agent_eval_metric(agent_id, trade_date);
+CREATE INDEX IF NOT EXISTS idx_agent_capital_flow_agent ON agent_capital_flow(agent_id, flow_date);
 CREATE INDEX IF NOT EXISTS idx_reflection_agent ON agent_reflection_task(agent_id, trade_date, status);
 CREATE INDEX IF NOT EXISTS idx_tg_feedback_chat ON telegram_recommend_feedback(chat_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_tg_eval_chat ON telegram_recommend_eval(chat_id, created_at);
