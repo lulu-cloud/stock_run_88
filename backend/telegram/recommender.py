@@ -11,6 +11,7 @@ from langchain_openai import ChatOpenAI
 from backend.config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL
 from backend.agents.react_loop import ReActLoop
 from backend.db.repository import get_conn, get_positions, list_trades
+from backend.llm.json_repair import extract_json_object as _extract_json_object_repaired
 from backend.llm.strategy_parser import natural_language_select, parse_strategy_request
 from backend.trading.calculator import calc_cumulative_return
 from backend.telegram.profile import (
@@ -1423,21 +1424,7 @@ def _build_recommend_llm() -> ChatOpenAI:
 
 
 def _extract_json_object(text: str) -> dict:
-    raw = (text or "").strip()
-    candidates = re.findall(r"```json\s*(\{.*?\})\s*```", raw, flags=re.S | re.I)
-    candidates.append(raw)
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start >= 0 and end > start:
-        candidates.append(raw[start:end + 1])
-    for item in reversed(candidates):
-        try:
-            data = json.loads(item)
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            continue
-    return {}
+    return _extract_json_object_repaired(text)
 
 
 def _coerce_markdown_react_reply(raw_output: str, user_input: str) -> dict:

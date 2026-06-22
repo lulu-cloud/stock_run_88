@@ -6,7 +6,6 @@
 
 import json
 import os
-import re
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import StructuredTool
 
@@ -15,6 +14,8 @@ from backend.agents.tools import AGENT_TOOLS
 from backend.agents.base import AgentContext, AgentDecision
 from backend.agents.react_loop import ReActLoop
 from backend.data.loader import load_daily
+from backend.llm.json_repair import extract_json_object
+from backend.llm.prompt_safety import untrusted_text_block
 from backend.trading.rules import normalize_ts_code
 from backend.macro.report import get_macro_daily_report_text
 
@@ -426,6 +427,7 @@ def run_agent_review(
     board_permissions = config.get("board_permissions") or {}
     style_prompt = (config.get("style_prompt") or "").strip()
     user_strategy = (config.get("user_strategy_original") or "").strip()
+    user_strategy_block = untrusted_text_block("user_strategy", user_strategy)
     stock_pool = config.get("stock_pool") or []
     stock_pool_enabled = bool(config.get("stock_pool_enabled"))
     allow_out_of_pool = bool(config.get("allow_out_of_pool"))
@@ -469,7 +471,7 @@ def run_agent_review(
 ## 当前Agent配置
 - Agent风格模板: {config.get("agent_type") or "custom"}
 - 风格提示词: {style_prompt or "未配置"}
-- 用户原始交易策略: {user_strategy or "未配置"}
+- 用户原始交易策略: {user_strategy_block}
 - 优先选股策略: {", ".join(preferred_strategies) if preferred_strategies else "未配置"}
 - 可用工具白名单: {", ".join(allowed_tool_names)}
 - 买入板块权限: {json.dumps(board_permissions, ensure_ascii=False)}
@@ -552,25 +554,8 @@ def run_agent_review(
 
 def _parse_trade_plan(output: str) -> dict:
     """从 Agent 输出中解析交易计划 JSON"""
-    candidates = []
-    candidates.extend(re.findall(r"```json\s*(\{.*?\})\s*```", output, flags=re.S | re.I))
-    candidates.extend(re.findall(r"```\s*(\{.*?\})\s*```", output, flags=re.S))
-    start = output.rfind("{")
-    while start >= 0:
-        snippet = output[start:].strip()
-        end = snippet.rfind("}")
-        if end >= 0:
-            candidates.append(snippet[:end + 1])
-        start = output.rfind("{", 0, start)
-
-    for text in reversed(candidates):
-        try:
-            data = json.loads(text.strip())
-        except json.JSONDecodeError:
-            continue
-        if isinstance(data, dict) and "orders" in data:
-            return data
-    return {}
+    data = extract_json_object(output)
+    return data if isinstance(data, dict) and "orders" in data else {}
 
 
 def _latest_close(ts_code: str) -> float:

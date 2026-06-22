@@ -3,10 +3,10 @@
 将用户自然语言描述解析为策略筛选条件，调用对应策略函数执行选股。
 """
 
-import json
 import pandas as pd
 from typing import Optional
 from backend.llm.client import chat
+from backend.llm.json_repair import extract_json_object
 import backend.strategies  # noqa: F401 - import registers built-in strategies
 from backend.strategies.registry import StrategyRegistry
 from backend.data.loader import load_daily, compute_mas, compute_limit_status, list_main_board_stocks
@@ -151,23 +151,23 @@ def parse_strategy_request(user_input: str) -> dict:
 
     response = chat(STRATEGY_PARSER_PROMPT, user_input, temperature=0.1)
 
-    # 提取 JSON（处理 markdown code block 包裹）
-    json_str = response.strip()
-    if json_str.startswith("```"):
-        lines = json_str.split("\n")
-        json_str = "\n".join(lines[1:-1])
+    parsed = extract_json_object(response)
+    if parsed:
+        parsed.setdefault("params", {})
+        parsed.setdefault("max_results", 20)
+        parsed.setdefault("explanation", "")
+        parsed.setdefault("use_custom", False)
+        parsed.setdefault("custom_filters", [])
+        return parsed
 
-    try:
-        return json.loads(json_str)
-    except json.JSONDecodeError:
-        heuristic = _heuristic_parse(user_input)
-        return heuristic or {
-            "strategy": None,
-            "params": {},
-            "explanation": f"解析失败，原始回复: {response[:200]}",
-            "use_custom": True,
-            "custom_filters": [],
-        }
+    heuristic = _heuristic_parse(user_input)
+    return heuristic or {
+        "strategy": None,
+        "params": {},
+        "explanation": f"解析失败，原始回复: {response[:200]}",
+        "use_custom": True,
+        "custom_filters": [],
+    }
 
 
 def run_strategy_selection(strategy_name: str, params: dict, max_results: int = 20) -> list:

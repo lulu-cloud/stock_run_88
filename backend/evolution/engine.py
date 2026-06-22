@@ -10,6 +10,7 @@ from backend.config import LOGS_DIR
 from backend.evolution.memory import seed_agent_style_memory, snapshot_memory, update_memory
 from backend.evolution.minute_replay import build_intraday_replay
 from backend.evolution.skills import ensure_default_skills, list_skill_index, update_skill_confidence
+from backend.llm.prompt_safety import untrusted_text_block
 
 
 def prepare_evolution_context(agent_id: int, agent_name: str, trade_date: str, conn) -> dict:
@@ -105,6 +106,7 @@ def format_evolution_prompt(context: dict | None) -> str:
     allowed_tools = agent_config.get("allowed_tools") or []
     preferred_strategies = agent_config.get("preferred_strategies") or []
     style_prompt = (agent_config.get("style_prompt") or "").strip()
+    user_strategy = (agent_config.get("user_strategy_original") or "").strip()
     board_permissions = agent_config.get("board_permissions") or {}
     return "\n".join([
         "## 进化记忆快照（今日决策必须基于此快照，盘后才允许更新）",
@@ -120,6 +122,7 @@ def format_evolution_prompt(context: dict | None) -> str:
         "\n".join(skill_lines) if skill_lines else "暂无技能，按默认谨慎模式。",
         "## Agent配置约束",
         f"- Agent风格提示词: {style_prompt or '未配置'}",
+        f"- 用户原始交易策略: {untrusted_text_block('user_strategy', user_strategy)}",
         f"- 优先选股策略: {', '.join(preferred_strategies) if preferred_strategies else '未配置，按风格自主选择'}",
         f"- 严格工具白名单: {', '.join(allowed_tools) if allowed_tools else '未配置，允许默认工具集'}",
         f"- 买入板块权限: {json.dumps(board_permissions, ensure_ascii=False)}",
