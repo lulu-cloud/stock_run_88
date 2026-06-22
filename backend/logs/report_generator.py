@@ -20,6 +20,21 @@ def _no_action_note(trades: list[dict], decision: AgentDecision | None) -> str:
     return "本轮没有成交、没有新条件单，但 Agent 未给出充分观望理由；已标记为复盘改进项。"
 
 
+def _trade_reason_for_report(trade: dict, trade_date: str) -> str:
+    reason = str(trade.get("reason") or "").strip()
+    order_trade_date = str(trade.get("order_trade_date") or trade.get("planned_trade_date") or "")
+    created_at = str(trade.get("order_created_at") or "")
+    created_day = created_at[:10].replace("-", "") if created_at else ""
+    source_day = order_trade_date or created_day
+    if source_day and source_day != str(trade_date):
+        note = (
+            f"[旧预操作单说明: 该理由来自{source_day}决策上下文；"
+            f"本次成交按{trade_date}当日行情撮合，成交价以本表价格为准。]"
+        )
+        return f"{note} {reason}".strip()
+    return reason
+
+
 def generate_daily_report(agent_id: int, agent_name: str, trade_date: str,
                           context: AgentContext, trades: list[dict],
                           decision: AgentDecision | None = None,
@@ -50,7 +65,7 @@ def generate_daily_report(agent_id: int, agent_name: str, trade_date: str,
 
     trades_md = ""
     for t in trades:
-        reason = t.get("reason", "")
+        reason = _trade_reason_for_report(t, trade_date)
         trades_md += (
             f"| {t.get('ts_code', '')} | {t.get('stock_name', '')} | {t.get('direction', '')} | {t.get('quantity', 0)} | "
             f"{t.get('price', 0):.2f} | {t.get('total_value', 0):.2f} | "

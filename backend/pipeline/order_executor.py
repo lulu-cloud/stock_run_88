@@ -201,6 +201,8 @@ def execute_orders(agent_id: int, trade_date: str,
             "commission": fee.get("commission", 0),
             "stamp_tax": fee.get("stamp_tax", 0),
             "trade_date": trade_date,
+            "order_trade_date": order.get("trade_date", ""),
+            "order_created_at": order.get("created_at", ""),
             "reason": order.get("reason", ""),
             "open_get_in": bool(order.get("open_get_in")),
         }
