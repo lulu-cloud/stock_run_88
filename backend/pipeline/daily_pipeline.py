@@ -18,7 +18,12 @@ from backend.db.repository import (
     refresh_decision_batch_status,
 )
 from backend.data.loader import load_daily, load_index_daily
-from backend.trading.calculator import calc_total_assets, calc_cumulative_return
+from backend.trading.calculator import (
+    calc_cumulative_return,
+    calc_flow_adjusted_daily_pnl,
+    calc_flow_adjusted_daily_return,
+    calc_total_assets,
+)
 from backend.trading.rules import match_order_price, calc_buy_fee, calc_sell_fee, can_trade_today, normalize_ts_code
 from backend.agents.base import AgentContext, AgentDecision
 from backend.agents.idea_pool import (
@@ -1041,13 +1046,36 @@ def _position_holding_days(pos: dict, trade_date: str) -> int:
         return 0
 
 
-def _previous_total_assets(agent_id: int, trade_date: str, initial_capital: float, conn: sqlite3.Connection) -> float:
-    row = conn.execute(
-        """SELECT total_assets FROM agent_daily_report
-           WHERE agent_id=? AND trade_date<? ORDER BY trade_date DESC LIMIT 1""",
-        (agent_id, trade_date),
-    ).fetchone()
-    return float(row["total_assets"] if row else initial_capital)
+def _date_key(value: str | None) -> str:
+    return "".join(ch for ch in str(value or "") if ch.isdigit())[:8]
+
+
+def _capital_flow_between_reports(
+    agent_id: int,
+    previous_trade_date: str | None,
+    trade_date: str,
+    conn: sqlite3.Connection,
+) -> float:
+    start_key = _date_key(previous_trade_date)
+    end_key = _date_key(trade_date)
+    rows = conn.execute(
+        """SELECT flow_date, flow_type, amount
+           FROM agent_capital_flow
+           WHERE agent_id=?""",
+        (agent_id,),
+    ).fetchall()
+    total = 0.0
+    for row in rows:
+        flow_key = _date_key(row["flow_date"])
+        if not flow_key:
+            continue
+        if start_key and flow_key <= start_key:
+            continue
+        if end_key and flow_key > end_key:
+            continue
+        amount = float(row["amount"] or 0)
+        total += amount if row["flow_type"] == "deposit" else -amount
+    return round(total, 2)
 
 
 def _risk_control_orders(
@@ -1066,8 +1094,19 @@ def _risk_control_orders(
     max_holding_days = int(risk_cfg.get("max_holding_days") or risk_cfg.get("max_position_days") or 0)
     stop_loss_pct = abs(float(risk_cfg.get("stop_loss_pct") or 0))
     stop_profit_pct = abs(float(risk_cfg.get("stop_profit_pct") or 0))
-    prev_assets = _previous_total_assets(agent_id, trade_date, initial_capital, conn)
-    daily_return = ((total_assets - prev_assets) / prev_assets) if prev_assets else 0.0
+    prev_report = conn.execute(
+        """SELECT trade_date, total_assets FROM agent_daily_report
+           WHERE agent_id=? AND trade_date<? ORDER BY trade_date DESC LIMIT 1""",
+        (agent_id, trade_date),
+    ).fetchone()
+    prev_assets = float(prev_report["total_assets"] if prev_report else initial_capital)
+    net_capital_flow = _capital_flow_between_reports(
+        agent_id,
+        prev_report["trade_date"] if prev_report else None,
+        trade_date,
+        conn,
+    )
+    daily_return = calc_flow_adjusted_daily_return(total_assets, prev_assets, net_capital_flow) / 100
     circuit = bool(max_daily_loss > 0 and daily_return <= -max_daily_loss)
     orders: list[dict] = []
     meta = {
@@ -1689,13 +1728,19 @@ def run_daily_pipeline(trade_date: str = None, agent_ids: list[int] | None = Non
         context.frozen_cash = frozen_cash
 
         prev_report = conn.execute(
-            """SELECT total_assets FROM agent_daily_report
+            """SELECT trade_date, total_assets FROM agent_daily_report
                WHERE agent_id=? AND trade_date<? ORDER BY trade_date DESC LIMIT 1""",
             (agent_id, trade_date),
         ).fetchone()
         prev_assets = float(prev_report["total_assets"] if prev_report else agent["initial_capital"])
-        daily_pnl = total_assets - prev_assets
-        daily_return = (daily_pnl / prev_assets * 100) if prev_assets else 0.0
+        net_capital_flow = _capital_flow_between_reports(
+            agent_id,
+            prev_report["trade_date"] if prev_report else None,
+            trade_date,
+            conn,
+        )
+        daily_pnl = calc_flow_adjusted_daily_pnl(total_assets, prev_assets, net_capital_flow)
+        daily_return = calc_flow_adjusted_daily_return(total_assets, prev_assets, net_capital_flow)
         cumulative_pnl = total_assets - agent["initial_capital"]
 
         report_path = generate_daily_report(

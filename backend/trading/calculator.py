@@ -79,6 +79,28 @@ def calc_daily_return(daily_pnl: float, prev_total_assets: float) -> float:
     return round(daily_pnl / prev_total_assets * 100, 4)
 
 
+def calc_flow_adjusted_daily_pnl(
+    total_assets: float,
+    prev_total_assets: float,
+    net_capital_flow: float = 0.0,
+) -> float:
+    """Calculate daily PnL after removing external deposits/withdrawals."""
+    return round(float(total_assets or 0) - float(prev_total_assets or 0) - float(net_capital_flow or 0), 2)
+
+
+def calc_flow_adjusted_daily_return(
+    total_assets: float,
+    prev_total_assets: float,
+    net_capital_flow: float = 0.0,
+) -> float:
+    """Calculate daily return after treating external flows as capital base changes."""
+    adjusted_start_assets = float(prev_total_assets or 0) + float(net_capital_flow or 0)
+    if adjusted_start_assets <= 0:
+        return 0.0
+    daily_pnl = calc_flow_adjusted_daily_pnl(total_assets, prev_total_assets, net_capital_flow)
+    return round(daily_pnl / adjusted_start_assets * 100, 4)
+
+
 def calc_cumulative_return(total_assets: float, initial_capital: float) -> float:
     """计算累计收益率"""
     if initial_capital <= 0:
