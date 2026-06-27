@@ -253,7 +253,7 @@ def _handle_update(update: dict):
         send_message(chat_id, format_login_code_message(result, user_id))
         _state["last_message"] = text[:200]
         return
-    gate = preflight_route(text)
+    gate = preflight_route(text, chat_id=chat_id, thread_id=thread_id)
     if is_lightweight_action(gate.action):
         result = send_rich_message(chat_id, gate.reply, "推荐助手")
         if not result.get("ok"):

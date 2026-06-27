@@ -211,6 +211,8 @@ Telegram 推荐助手用于自然语言投研。
 /profile
 /profile set 风险=中等 周期=短线 板块=AI,半导体
 /memory
+/settle
+/settle 1
 /memory forget 关键词
 /watch add 000725.SZ
 /watch list

@@ -1805,7 +1805,7 @@ def handle_text_message(
 ) -> str:
     """Record scoped memory around the existing Telegram text parser."""
     raw = (text or "").strip()
-    gate = preflight_route(raw)
+    gate = preflight_route(raw, chat_id=chat_id, thread_id=thread_id)
     if is_lightweight_action(gate.action):
         return gate.reply
     intent = _guess_intent(raw)
@@ -1870,6 +1870,19 @@ def _handle_text_message_inner(
     lower = raw.lower()
     profile_key = _context_key(chat_id or "local", user_id)
     profile = apply_inferred_preferences(profile_key, raw, username) if chat_id else None
+    if lower.startswith("/settle"):
+        parts = raw.split()
+        if len(parts) > 2 or (len(parts) == 2 and not parts[1].isdigit()):
+            return "用法: /settle 或 /settle <agent_id>"
+        agent_id = int(parts[1]) if len(parts) == 2 else None
+        from backend.telegram.manual_settlement import start_manual_settlement
+
+        return start_manual_settlement(
+            chat_id=chat_id,
+            user_id=user_id,
+            username=username,
+            agent_id=agent_id,
+        )
     if _is_position_advice_query(raw):
         return _format_position_advice(raw, chat_id or "local", username, profile, user_id, thread_id, progress_callback)
     if _is_emotional_risk_help_query(raw):
@@ -1890,6 +1903,7 @@ def _handle_text_message_inner(
             "/watch add 600000.SH / /watch list / /watch remove 600000.SH\n"
             "/daily on / /daily off\n"
             "/intraday 盘中检查关注股、板块和待触发条件单\n"
+            "/settle 手动结算全部已启用交易员，/settle 1 指定 Agent\n"
             "/backtest ma_bullish_pullback 1m\n"
             "/memory 查看记忆 / /memory forget 关键词\n"
             "/init xulu hsw 150000 100000 初始化合伙账户\n"

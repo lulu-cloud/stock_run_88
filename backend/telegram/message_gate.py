@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 
 @dataclass(frozen=True)
@@ -20,8 +21,15 @@ COMMAND_PREFIXES = (
     "/login", "/whoami", "/watch", "/profile", "/memory", "/recommend",
     "/compare", "/intraday", "/alert", "/analyze", "/backtest", "/bt",
     "/daily", "/init", "/history", "/status", "/sim", "/bind",
-    "/render_test", "/start", "/help",
+    "/render_test", "/settle", "/start", "/help",
 )
+
+CONTEXTUAL_STOCK_INTENTS = {
+    "recommend", "analyze", "position_advice", "compare", "ma_check",
+    "market_data", "policy", "followup", "backtest", "intraday",
+    "watchlist", "refresh", "help",
+}
+CONTEXT_FOLLOWUP_MINUTES = 30
 
 STOCK_TASK_KEYWORDS = (
     "股票", "a股", "A股", "大盘", "上证", "深成", "创业板", "北向", "沪深港通",
@@ -137,7 +145,57 @@ def _looks_out_of_scope(raw: str) -> bool:
     return any(token in raw for token in unrelated)
 
 
-def preflight_route(text: str) -> GateResult:
+def _parse_created_at(value: str) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _has_recent_stock_context(
+    chat_id: str,
+    thread_id: str,
+    now: datetime | None = None,
+) -> bool:
+    if not chat_id:
+        return False
+    try:
+        from backend.telegram.memory import get_recent_context
+
+        recent = get_recent_context(chat_id, thread_id, limit=6)
+    except Exception:
+        return False
+    latest_assistant = next(
+        (item for item in reversed(recent) if item.get("role") == "assistant"),
+        None,
+    )
+    if not latest_assistant:
+        return False
+    created_at = _parse_created_at(latest_assistant.get("created_at"))
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    current = current.astimezone(timezone.utc)
+    if not created_at or (current - created_at).total_seconds() > CONTEXT_FOLLOWUP_MINUTES * 60:
+        return False
+    intent = str(latest_assistant.get("intent") or "").strip()
+    return intent in CONTEXTUAL_STOCK_INTENTS or _looks_like_stock_question(
+        str(latest_assistant.get("content") or "")
+    )
+
+
+def preflight_route(
+    text: str,
+    chat_id: str = "",
+    thread_id: str = "default",
+    now: datetime | None = None,
+) -> GateResult:
     raw = _clean(text)
     lower = raw.lower()
     compact = re.sub(r"[，。！？!?.、~～\s]+", "", raw)
@@ -148,6 +206,8 @@ def preflight_route(text: str) -> GateResult:
     if compact in GREETING_TEXTS or lower in GREETING_TEXTS:
         return GateResult("boundary_intro", BOUNDARY_INTRO, "greeting")
     if compact in SHORT_CHAT_TEXTS or lower in SHORT_CHAT_TEXTS:
+        if _has_recent_stock_context(chat_id, thread_id, now):
+            return GateResult("agent_task", reason="contextual_short_reply")
         return GateResult("simple_reply", SHORT_GUIDE, "short_chat")
     if _looks_like_stock_question(raw):
         return GateResult("agent_task", reason="stock_or_market")

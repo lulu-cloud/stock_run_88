@@ -62,6 +62,7 @@ _data_fetch_state = {
     "last_result": None,
     "last_error": "",
 }
+_agent_settlement_lock = threading.Lock()
 
 
 def _agent_review_worker(queue, agent_id: int, agent_name: str, context: AgentContext,
@@ -1837,7 +1838,21 @@ def run_daily_pipeline(trade_date: str = None, agent_ids: list[int] | None = Non
     return results
 
 
-def run_due_agents(now: datetime | None = None) -> dict:
+def _mark_agent_run_complete(agent_id: int, trade_date: str):
+    conn = get_conn()
+    conn.execute(
+        """INSERT INTO agent_schedule (agent_id, enabled, last_run_date, retry_count, next_retry_at)
+           VALUES (?, 1, ?, 0, NULL)
+           ON CONFLICT(agent_id) DO UPDATE SET
+           last_run_date=excluded.last_run_date, retry_count=0, next_retry_at=NULL,
+           updated_at=datetime('now')""",
+        (agent_id, trade_date),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _run_due_agents_unlocked(now: datetime | None = None) -> dict:
     """定时调度入口：由系统 cron 高频调用（如每5分钟）。
 
     流程：
@@ -1980,17 +1995,7 @@ def run_due_agents(now: datetime | None = None) -> dict:
                     results["agents"][agent_name]["telegram"] = {"ok": False, "error": str(push_error)}
 
             # 清除重试状态
-            conn2 = get_conn()
-            conn2.execute(
-                """INSERT INTO agent_schedule (agent_id, enabled, last_run_date, retry_count, next_retry_at)
-                   VALUES (?, 1, ?, 0, NULL)
-                   ON CONFLICT(agent_id) DO UPDATE SET
-                   last_run_date=excluded.last_run_date, retry_count=0, next_retry_at=NULL,
-                   updated_at=datetime('now')""",
-                (agent_id, expected_date_str),
-            )
-            conn2.commit()
-            conn2.close()
+            _mark_agent_run_complete(agent_id, expected_date_str)
         except Exception as e:
             # 回滚
             rollback_agent_state(agent_id, snapshot)
@@ -1998,6 +2003,140 @@ def run_due_agents(now: datetime | None = None) -> dict:
             results["agents"][agent_name] = {"status": "rolled_back", "error": str(e)}
 
     return results
+
+
+def run_due_agents(now: datetime | None = None) -> dict:
+    """Run scheduled settlements unless another settlement is already active."""
+    if not _agent_settlement_lock.acquire(blocking=False):
+        return {
+            "status": "busy",
+            "date": (now or datetime.now(ZoneInfo("Asia/Shanghai"))).strftime("%Y%m%d"),
+            "due": 0,
+            "agents": {},
+        }
+    try:
+        return _run_due_agents_unlocked(now)
+    finally:
+        _agent_settlement_lock.release()
+
+
+def run_manual_settlement(
+    agent_ids: list[int] | None = None,
+    now: datetime | None = None,
+    push_now: bool = True,
+) -> dict:
+    """Run enabled Agent settlements immediately without fetching market data."""
+    now = now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+    if is_stock_trade_day(now.date()) and now.strftime("%H:%M") < "15:05":
+        return {
+            "status": "market_open",
+            "message": "交易日 15:05 前不能手动结算，避免使用未完成的日 K 数据。",
+            "expected_trading_day": now.strftime("%Y%m%d"),
+            "agents": {},
+        }
+    if not _agent_settlement_lock.acquire(blocking=False):
+        return {
+            "status": "busy",
+            "message": "已有自动或手动结算任务正在运行，请稍后再试。",
+            "agents": {},
+        }
+
+    try:
+        expected_date_str = _latest_trading_day(now.date()).strftime("%Y%m%d")
+        conn = get_conn()
+        sql = """SELECT a.*, s.enabled AS sched_enabled, s.review_time AS sched_review_time,
+                        s.push_time AS sched_push_time, s.last_run_date, s.retry_count, s.next_retry_at
+                 FROM agent_info a
+                 LEFT JOIN agent_schedule s ON s.agent_id = a.id
+                 WHERE a.status='active'
+                   AND (s.enabled=1 OR a.schedule_enabled=1)"""
+        params: list = []
+        if agent_ids:
+            normalized_ids = sorted({int(agent_id) for agent_id in agent_ids})
+            sql += f" AND a.id IN ({','.join('?' for _ in normalized_ids)})"
+            params.extend(normalized_ids)
+        rows = [dict(row) for row in conn.execute(sql, tuple(params)).fetchall()]
+        conn.close()
+
+        result = {
+            "status": "checking",
+            "date": now.strftime("%Y%m%d"),
+            "expected_trading_day": expected_date_str,
+            "data_ready": False,
+            "due": 0,
+            "agents": {},
+        }
+        if not rows:
+            result.update({
+                "status": "no_enabled_agents",
+                "message": "没有找到符合条件且已启用定时复盘的交易员。",
+            })
+            return result
+
+        data_ready = check_data_freshness(expected_date_str)
+        result["data_ready"] = data_ready
+        if not data_ready:
+            result.update({
+                "status": "data_not_ready",
+                "message": f"{expected_date_str} 行情数据尚未准备好，本次未启动复盘。",
+            })
+            return result
+
+        due = [row for row in rows if row.get("last_run_date") != expected_date_str]
+        for row in rows:
+            if row.get("last_run_date") == expected_date_str:
+                result["agents"][row["display_name"]] = {"status": "already_settled"}
+        result["due"] = len(due)
+        if not due:
+            result.update({
+                "status": "already_settled",
+                "message": f"{expected_date_str} 的目标交易员均已完成结算。",
+            })
+            return result
+
+        try:
+            from backend.macro.report import generate_macro_report, has_usable_macro_report
+            if not has_usable_macro_report(expected_date_str):
+                result["macro_report"] = generate_macro_report(expected_date_str, force=False)
+            else:
+                result["macro_report"] = {"ok": True, "skipped": True, "trade_date": expected_date_str}
+        except Exception as macro_error:
+            result["macro_report"] = {"ok": False, "error": str(macro_error), "trade_date": expected_date_str}
+
+        failed = False
+        for agent in due:
+            agent_id = int(agent["id"])
+            agent_name = agent["display_name"]
+            snapshot = snapshot_agent_state(agent_id)
+            try:
+                print(f"[ManualSettlement] running agent {agent_id} {agent_name} for {expected_date_str}")
+                pipeline_result = run_daily_pipeline(expected_date_str, [agent_id], fail_fast=True)
+                agent_result = pipeline_result.get(agent_name, {"status": "ok"})
+                if not isinstance(agent_result, dict):
+                    agent_result = {"status": "ok", "result": agent_result}
+                if push_now:
+                    try:
+                        agent_result["telegram"] = _push_agent_once(agent_id, expected_date_str)
+                    except Exception as push_error:
+                        agent_result["telegram"] = {"ok": False, "error": str(push_error)}
+                _mark_agent_run_complete(agent_id, expected_date_str)
+                result["agents"][agent_name] = agent_result
+            except Exception as exc:
+                failed = True
+                rollback_agent_state(agent_id, snapshot)
+                result["agents"][agent_name] = {"status": "rolled_back", "error": str(exc)}
+
+        result["status"] = "partial_failure" if failed else "completed"
+        result["message"] = (
+            f"{expected_date_str} 手动结算完成，处理 {len(due)} 个交易员。"
+            if not failed else
+            f"{expected_date_str} 手动结算已结束，部分交易员失败并已回滚。"
+        )
+        return result
+    finally:
+        _agent_settlement_lock.release()
 
 
 def simulate_day(trade_date: str):
