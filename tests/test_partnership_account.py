@@ -38,10 +38,16 @@ class PartnershipAccountTestCase(unittest.TestCase):
 
             conn = self._conn()
             rows = {r["name"]: dict(r) for r in conn.execute("SELECT * FROM participants").fetchall()}
+            index_row = conn.execute(
+                "SELECT * FROM xulu_index_daily ORDER BY trade_date DESC LIMIT 1"
+            ).fetchone()
             conn.close()
             self.assertAlmostEqual(rows["xulu"]["equity"], 150600.0)
             self.assertAlmostEqual(rows["hsw"]["equity"], 105400.0)
             self.assertAlmostEqual(rows["hsw"]["net_invest"], 105000.0)
+            self.assertIsNotNone(index_row)
+            self.assertAlmostEqual(index_row["index_value"], 1000.0)
+            self.assertAlmostEqual(index_row["daily_pnl"], 1000.0)
 
     def test_natural_daily_uses_partner_alias(self):
         with patch.object(pa, "get_conn", self._conn):
@@ -89,12 +95,39 @@ class PartnershipAccountTestCase(unittest.TestCase):
             rows = {r["name"]: dict(r) for r in conn.execute("SELECT * FROM participants").fetchall()}
             history_count = conn.execute("SELECT COUNT(*) FROM daily_history").fetchone()[0]
             hist = conn.execute("SELECT * FROM daily_history WHERE date='2026-06-22'").fetchone()
+            index_row = conn.execute(
+                "SELECT * FROM xulu_index_daily WHERE trade_date='2026-06-22'"
+            ).fetchone()
             conn.close()
             self.assertAlmostEqual(account["last_total_asset"], 260000.0)
             self.assertAlmostEqual(rows["xulu"]["equity"], 156000.0)
             self.assertAlmostEqual(rows["hsw"]["equity"], 104000.0)
             self.assertEqual(history_count, 1)
             self.assertAlmostEqual(hist["total_asset"], 260000.0)
+            self.assertAlmostEqual(index_row["total_asset"], 260000.0)
+            self.assertAlmostEqual(index_row["daily_pnl"], 10000.0)
+
+    def test_daily_rolls_back_account_when_index_write_fails(self):
+        with patch.object(pa, "get_conn", self._conn):
+            pa.partnership_init_account("/init xulu hsw 150000 100000")
+            with patch.object(
+                pa, "upsert_xulu_index_daily", side_effect=RuntimeError("index write failed")
+            ):
+                with self.assertRaisesRegex(RuntimeError, "index write failed"):
+                    pa.partnership_daily_report("/daily 256000")
+
+            conn = self._conn()
+            account = conn.execute("SELECT * FROM account").fetchone()
+            participants = conn.execute(
+                "SELECT name, equity FROM participants ORDER BY name"
+            ).fetchall()
+            daily_count = conn.execute("SELECT COUNT(*) FROM daily_history").fetchone()[0]
+            index_count = conn.execute("SELECT COUNT(*) FROM xulu_index_daily").fetchone()[0]
+            conn.close()
+            self.assertAlmostEqual(account["last_total_asset"], 250000.0)
+            self.assertEqual([row["equity"] for row in participants], [100000.0, 150000.0])
+            self.assertEqual(daily_count, 0)
+            self.assertEqual(index_count, 0)
 
     def test_recommender_routes_account_commands_before_agent_status(self):
         with patch.object(recommender, "apply_inferred_preferences", return_value=None), \

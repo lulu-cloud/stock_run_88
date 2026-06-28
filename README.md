@@ -213,11 +213,35 @@ Telegram 推荐助手用于自然语言投研。
 /memory
 /settle
 /settle 1
+/daily 480271.11
+/daily amend 480271.11
+/xulu
+/xulu 30
 /memory forget 关键词
 /watch add 000725.SZ
 /watch list
 /recommend 推荐几个多头均线向上的股票
 ```
+
+### Xulu 实盘策略指数
+
+`/daily` 在更新合伙账户权益时，会在同一个数据库事务中更新以 1000 点为基准的
+资金流调整指数。银证转入和转出只影响资金规模，不计入策略盈亏；`/daily amend`
+会同步更正当天指数。`/xulu [天数]` 展示当前点位、累计收益、历史最高、最大回撤、
+胜率及最近记录，默认 10 条、最多 60 条。
+
+历史导入使用脱敏 JSON 作为生产输入，原始券商文件不进入 Git：
+
+```bash
+python scripts/import_xulu_index_history.py \
+  --db data/stock_run.db --legacy /path/to/table.xls \
+  --gf /path/to/gf-flow.xlsx --output-json /tmp/xulu-index.json
+python scripts/import_xulu_index_history.py \
+  --db data/stock_run.db --rows-json /tmp/xulu-index.json --apply
+```
+
+第一条命令默认只做 dry-run；`--apply` 会先通过 SQLite backup API 创建一致性备份，
+再在单个事务中幂等导入。
 
 ## 股票与行情功能
 
@@ -481,6 +505,7 @@ POST /api/strategy/search
 - `telegram_session_summary`
 - `telegram_memory_distill_state`
 - `shared_stock_report`
+- `xulu_index_daily`
 
 SQLite 使用 WAL 和 busy timeout，适合当前单用户/轻量服务规模。
 

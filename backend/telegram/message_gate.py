@@ -21,7 +21,7 @@ COMMAND_PREFIXES = (
     "/login", "/whoami", "/watch", "/profile", "/memory", "/recommend",
     "/compare", "/intraday", "/alert", "/analyze", "/backtest", "/bt",
     "/daily", "/init", "/history", "/status", "/sim", "/bind",
-    "/render_test", "/settle", "/start", "/help",
+    "/render_test", "/settle", "/xulu", "/start", "/help",
 )
 
 CONTEXTUAL_STOCK_INTENTS = {

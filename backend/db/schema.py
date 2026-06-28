@@ -552,6 +552,25 @@ CREATE TABLE IF NOT EXISTS daily_history (
     allocation  TEXT
 );
 
+CREATE TABLE IF NOT EXISTS xulu_index_daily (
+    trade_date        TEXT PRIMARY KEY,
+    index_value       REAL NOT NULL,
+    daily_return      REAL DEFAULT 0.0,
+    cumulative_return REAL DEFAULT 0.0,
+    total_asset       REAL NOT NULL,
+    daily_pnl         REAL DEFAULT 0.0,
+    net_flow          REAL DEFAULT 0.0,
+    cash              REAL,
+    market_value      REAL,
+    source            TEXT NOT NULL DEFAULT 'daily_history',
+    is_estimated      INTEGER DEFAULT 0,
+    detail_json       TEXT DEFAULT '{}',
+    created_at        TEXT DEFAULT (datetime('now')),
+    updated_at        TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_xulu_index_date ON xulu_index_daily(trade_date);
+
 CREATE TABLE IF NOT EXISTS shared_stock_report (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     ts_code         TEXT NOT NULL,

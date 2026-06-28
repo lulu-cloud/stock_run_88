@@ -8,6 +8,11 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from backend.db.repository import get_conn
+from backend.telegram.xulu_index import (
+    format_xulu_index,
+    format_xulu_index_snapshot,
+    upsert_xulu_index_daily,
+)
 
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -64,6 +69,7 @@ def account_help() -> str:
     return "\n".join([
         "合伙账户命令:",
         "/init xulu hsw 150000 100000",
+        "/xulu 查看 Xulu 指数，/xulu 30 查看最近30条",
         "/init 初始建仓，xulu出资15万，hsw出资10万",
         "/daily 256000 0 5000",
         "/daily amend 465759.29  更正最近一天录错的总资产",
@@ -271,6 +277,15 @@ def _apply_daily_update(
             ),
         )
     conn.execute("UPDATE account SET last_total_asset=?, last_date=?", (total_asset, trade_date))
+    index_row = upsert_xulu_index_daily(
+        conn,
+        trade_date=trade_date,
+        total_asset=total_asset,
+        daily_pnl=daily_pnl,
+        net_flow=total_flow,
+        source="daily_history",
+        detail={"cash_flows": flows, "allocation": allocation},
+    )
     conn.commit()
 
     updated = _participants(conn)
@@ -305,6 +320,7 @@ def _apply_daily_update(
             f"分得盈亏 {_fmt_money(allocation[name])}，出入金 {_fmt_money(flows.get(name, 0))}，"
             f"当前权益 {_fmt_money(now['equity'])}，累计盈亏 {_fmt_money(pnl_total)}"
         )
+    lines.extend(["", format_xulu_index_snapshot(index_row)])
     return "\n".join(lines)
 
 
@@ -418,12 +434,19 @@ def partnership_history(limit: int = 7) -> str:
     return "\n".join(lines)
 
 
+def partnership_xulu_index(text: str = "/xulu") -> str:
+    match = re.search(r"\d+", text or "")
+    return format_xulu_index(int(match.group(0)) if match else 10)
+
+
 def dispatch_partnership_command(text: str) -> str:
     """Dispatch a partnership account command through deterministic tools."""
     raw = (text or "").strip()
     lower = raw.lower()
     if lower.startswith("/init"):
         return partnership_init_account(raw)
+    if lower.startswith("/xulu"):
+        return partnership_xulu_index(raw)
     if lower.startswith("/daily") or any(token in raw for token in ("总资产", "总权益", "入金", "出金", "转入", "转出")):
         return partnership_daily_report(raw)
     if lower.startswith("/history") or raw.startswith("历史"):
@@ -437,7 +460,7 @@ def dispatch_partnership_command(text: str) -> str:
 def is_partnership_account_message(text: str) -> bool:
     raw = (text or "").strip()
     lower = raw.lower()
-    if lower.startswith("/init") or lower.startswith("/history"):
+    if lower.startswith("/init") or lower.startswith("/history") or lower.startswith("/xulu"):
         return True
     if lower.startswith("/daily"):
         return not ("on" in lower or "off" in lower or "开启" in raw or "关闭" in raw)
