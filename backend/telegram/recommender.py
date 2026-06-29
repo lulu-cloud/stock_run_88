@@ -1904,7 +1904,7 @@ def _handle_text_message_inner(
             "/daily on / /daily off\n"
             "/intraday 盘中检查关注股、板块和待触发条件单\n"
             "/settle 手动结算全部已启用交易员，/settle 1 指定 Agent\n"
-            "/xulu æŸ¥çœ‹ Xulu å®žç›˜ç­–ç•¥æŒ‡æ•°ï¼Œ/xulu 30 æŸ¥çœ‹æœ€è¿‘30æ¡\n"
+            "/xulu 查看 Xulu 实盘策略指数，/xulu 30 查看最近30条\n"
             "/backtest ma_bullish_pullback 1m\n"
             "/memory 查看记忆 / /memory forget 关键词\n"
             "/init xulu hsw 150000 100000 初始化合伙账户\n"

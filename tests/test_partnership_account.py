@@ -145,6 +145,12 @@ class PartnershipAccountTestCase(unittest.TestCase):
         self.assertEqual(reply, "agent-status")
         fmt.assert_called_once_with(1)
 
+    def test_help_renders_xulu_command_as_utf8_chinese(self):
+        reply = recommender._handle_text_message_inner("/help")
+
+        self.assertIn("/xulu 查看 Xulu 实盘策略指数，/xulu 30 查看最近30条", reply)
+        self.assertNotIn("æŸ", reply)
+
 
 if __name__ == "__main__":
     unittest.main()
